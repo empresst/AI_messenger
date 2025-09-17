@@ -4,12 +4,12 @@ services:
     env: docker
     plan: free
     region: oregon
-    autoDeploy: true
     healthCheckPath: /
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: OPENAI_API_KEY
-        sync: false   # set in Render dashboard
+        sync: false
       - key: MONGODB_URI
-        sync: false   # set in Render dashboard (Atlas URI)
+        sync: false
       - key: PUBLIC_UI_API_KEY
         value: dev-key-123
