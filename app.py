@@ -2728,7 +2728,14 @@ async def initialize_db():
 # ---------------------
 # Run
 # ---------------------
+# if __name__ == "__main__":
+#     import uvicorn
+#     # Set PUBLIC_UI_API_KEY in env and use it in the UI "x-api-key" box.
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
 if __name__ == "__main__":
     import uvicorn
-    # Set PUBLIC_UI_API_KEY in env and use it in the UI "x-api-key" box.
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+    port = int(os.environ.get("PORT", 8000))  # Use PORT from env, fallback to 8000
+    uvicorn.run(app, host="0.0.0.0", port=port)
