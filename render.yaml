@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ai-twin
+    env: docker
+    plan: free
+    region: oregon
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false   # set in Render dashboard
+      - key: MONGODB_URI
+        sync: false   # set in Render dashboard (Atlas URI)
+      - key: PUBLIC_UI_API_KEY
+        value: dev-key-123
