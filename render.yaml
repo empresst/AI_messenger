@@ -1,10 +1,42 @@
+# services:
+#   - type: web
+#     name: ai-twin-fastapi
+#     env: python
+#     plan: free
+#     region: oregon
+#     healthCheckPath: /healthz
+#     autoDeploy: true
+#     buildCommand: |
+#       pip install --upgrade pip
+#       pip install -r requirements.txt
+#     startCommand: |
+#       uvicorn app:app --host 0.0.0.0 --port $PORT --proxy-headers --timeout-keep-alive 70
+#     envVars:
+#       - key: PYTHON_VERSION
+#         value: 3.11.9
+#       - key: OPENAI_API_KEY
+#         sync: false
+#       - key: MONGODB_URI
+#         sync: false
+#       - key: PUBLIC_UI_API_KEY
+#         generateValue: true
+#       - key: NLTK_DATA
+#         value: /tmp/nltk_data
+#       - key: SESSION_TTL_MIN
+#         value: "4320"
+#       # Set this to true only if you want demo users/messages auto-seeded
+#       - key: SEED_DEMO
+#         value: "false"
+
+
+
 services:
   - type: web
     name: ai-twin-fastapi
     env: python
     plan: free
     region: oregon
-    healthCheckPath: /healthz
+    healthCheckPath: /healthz  # or change to "/"
     autoDeploy: true
     buildCommand: |
       pip install --upgrade pip
@@ -19,11 +51,10 @@ services:
       - key: MONGODB_URI
         sync: false
       - key: PUBLIC_UI_API_KEY
-        generateValue: true
+        value: disabled          # <-- make public; or use generateValue:true to lock down
       - key: NLTK_DATA
         value: /tmp/nltk_data
       - key: SESSION_TTL_MIN
         value: "4320"
-      # Set this to true only if you want demo users/messages auto-seeded
       - key: SEED_DEMO
-        value: "false"
+        value: "false"           # <-- set "true" only if you want demo users/messages each deploy
