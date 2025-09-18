@@ -447,6 +447,7 @@ hr { border:0; border-top:1px solid var(--border); margin:12px 0 }
       </div>
       <div style="margin-top:10px">
         <div class="small">Server key for UI (x-api-key)</div>
+        <div class="small">Leave blank – signup/login works without a key.</div>
         <input id="gatewayKey" placeholder="x-api-key (server key)" />
       </div>
     </section>
@@ -738,9 +739,16 @@ document.addEventListener('DOMContentLoaded', ()=>{
 # ---------------------
 # Auth routes
 # ---------------------
-def require_api_key(x_api_key: str = Header(...)):
-    if x_api_key != PUBLIC_UI_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+# ---- Auth guard: allow disabling via PUBLIC_UI_API_KEY=disabled ----
+from typing import Optional
+
+def require_api_key(x_api_key: Optional[str] = Header(None)):
+    expected = (PUBLIC_UI_API_KEY or "").strip()
+    # If you set PUBLIC_UI_API_KEY=disabled (or empty), skip the check
+    if expected and expected.lower() != "disabled":
+        if x_api_key != expected:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
 
 @app.post("/auth/signup")
 async def signup(req: SignupRequest, _: None = Depends(require_api_key)):
