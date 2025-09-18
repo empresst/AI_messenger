@@ -19,3 +19,14 @@ This way, AI Messenger becomes your **digital twin**, reflecting your own though
 
 ---
 
+Here is the live link you can login with these names-
+username- nick
+pass- password
+
+username- nipa
+pass- password
+
+or signup and set relationship with them
+
+
+here you can talk with your family members and they can talk with you the same as you would do even if you are absent.
