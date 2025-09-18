@@ -36,7 +36,7 @@ services:
     env: python
     plan: free
     region: oregon
-    healthCheckPath: /healthz  # or change to "/"
+    healthCheckPath: /healthz
     autoDeploy: true
     buildCommand: |
       pip install --upgrade pip
@@ -51,10 +51,10 @@ services:
       - key: MONGODB_URI
         sync: false
       - key: PUBLIC_UI_API_KEY
-        value: disabled          # <-- make public; or use generateValue:true to lock down
+        value: disabled   # set to 'disabled' for public UI; otherwise remove this and use generateValue
       - key: NLTK_DATA
         value: /tmp/nltk_data
       - key: SESSION_TTL_MIN
         value: "4320"
       - key: SEED_DEMO
-        value: "false"           # <-- set "true" only if you want demo users/messages each deploy
+        value: "false"    # set true only if you want demo data on deploy
