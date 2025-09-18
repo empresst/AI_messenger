@@ -847,6 +847,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
     """
     return HTMLResponse(html)
 
+
 # ---------------------
 # Auth & API key
 # ---------------------
@@ -1632,7 +1633,6 @@ async def initialize_db():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT, proxy_headers=True, timeout_keep_alive=70)
-
 
 
 
