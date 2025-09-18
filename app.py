@@ -1456,31 +1456,43 @@
 #     )
 
 
+
+
+
+
+
+
+
+
+
 import os
 import json
 import re
-from typing import List, Optional, Tuple, Dict, Any
-from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, Depends, Query
-from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel
-from motor.motor_asyncio import AsyncIOMotorClient
+import hashlib
+import secrets
+import base64
 import uuid
+import threading
+import asyncio
+import logging
 from datetime import datetime, timedelta
+from typing import List, Optional, Tuple, Dict, Any
+from contextlib import asynccontextmanager
+
 import pytz
 import numpy as np
-import logging
-import spacy
-from nltk.corpus import wordnet
-import nltk
-from cachetools import TTLCache
+from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, Depends, Query
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
+
+# LangChain / FAISS / OpenAI
+from cachetools import TTLCache
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
-import threading
-import asyncio
-from contextlib import asynccontextmanager
-from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 
 # ---------------------
@@ -1490,11 +1502,23 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-twin-app")
 
 # ---------------------
-# NLTK & spaCy
+# NLTK & spaCy (hardened for Render)
 # ---------------------
-nltk.download('wordnet', quiet=True)
-nltk.download('punkt', quiet=True)
-nlp = spacy.load("en_core_web_sm")
+NLTK_DATA_DIR = os.getenv("NLTK_DATA", "/tmp/nltk_data")
+os.environ["NLTK_DATA"] = NLTK_DATA_DIR
+os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+
+import nltk
+nltk.download('wordnet', quiet=True, download_dir=NLTK_DATA_DIR)
+nltk.download('punkt', quiet=True, download_dir=NLTK_DATA_DIR)
+from nltk.corpus import wordnet
+
+import spacy
+try:
+    nlp = spacy.load("en_core_web_sm")
+except Exception:
+    logger.warning("spaCy model 'en_core_web_sm' not available; using spacy.blank('en') fallback.")
+    nlp = spacy.blank("en")
 
 # ---------------------
 # Env & constants
@@ -1503,14 +1527,14 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI")
 PUBLIC_UI_API_KEY = os.getenv("PUBLIC_UI_API_KEY", "your-secure-api-key")
+PORT = int(os.getenv("PORT", "8000"))
+SEED_DEMO = os.getenv("SEED_DEMO", "false").lower() == "true"
+SESSION_TTL_MIN = int(os.getenv("SESSION_TTL_MIN", "4320"))  # 3 days
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
 if not MONGODB_URI:
     raise RuntimeError("MONGODB_URI missing")
-
-# Session settings
-SESSION_TTL_MIN = int(os.getenv("SESSION_TTL_MIN", "4320"))  # 3 days default
 
 # ---------------------
 # Globals (thread-safe)
@@ -1560,8 +1584,7 @@ async def get_mongo_client() -> AsyncIOMotorClient:
                 maxPoolSize=50,
                 minPoolSize=5,
                 maxIdleTimeMS=30000,
-                tz_aware=True,
-                tzinfo=pytz.UTC
+                tz_aware=True
             )
             db = client["LF"]
             users_col = db["users"]
@@ -1642,16 +1665,14 @@ async def initialize_faiss_store():
                 await embeddings_col.delete_one({"item_id": item_id, "item_type": item_type})
                 continue
 
-            speaker_name = emb.get("speaker_name")
-            target_name = emb.get("target_name")
             metadata = {
                 "item_id": item_id,
                 "item_type": item_type,
                 "user_id": emb.get("user_id", []),
                 "speaker_id": emb.get("speaker_id"),
                 "target_id": emb.get("target_id"),
-                "speaker_name": speaker_name,
-                "target_name": target_name,
+                "speaker_name": emb.get("speaker_name"),
+                "target_name": emb.get("target_name"),
                 "timestamp": as_utc_aware(emb.get("timestamp"))
             }
             docs.append(Document(page_content=content, metadata=metadata))
@@ -1693,10 +1714,8 @@ async def require_session(x_session_token: str = Header(...)) -> Dict[str, Any]:
     return {"token": x_session_token, "user": user}
 
 # ---------------------
-# Password hashing (no external deps)
+# Password hashing
 # ---------------------
-import hashlib, secrets, base64
-
 def hash_password(password: str) -> Dict[str, str]:
     salt = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
@@ -1713,7 +1732,7 @@ def verify_password(password: str, salt_b64: str, hash_b64: str) -> bool:
 # ---------------------
 class ConnectionManager:
     def __init__(self):
-        self.active: Dict[str, WebSocket] = {}  # user_id -> socket
+        self.active: Dict[str, WebSocket] = {}
         self.lock = asyncio.Lock()
 
     async def connect(self, user_id: str, websocket: WebSocket):
@@ -1725,10 +1744,6 @@ class ConnectionManager:
         async with self.lock:
             self.active.pop(user_id, None)
 
-    async def is_online(self, user_id: str) -> bool:
-        async with self.lock:
-            return user_id in self.active
-
     async def send_to(self, user_id: str, data: dict):
         async with self.lock:
             ws = self.active.get(user_id)
@@ -1736,7 +1751,6 @@ class ConnectionManager:
             await ws.send_json(data)
 
     async def broadcast_presence(self):
-        # broadcast the list of online users
         async with self.lock:
             online = list(self.active.keys())
             sockets = list(self.active.values())
@@ -1750,7 +1764,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # ---------------------
-# FastAPI app
+# FastAPI app (+ healthcheck)
 # ---------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1776,6 +1790,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/healthz")
+async def healthz():
+    # Keep this independent of DB/OpenAI so Render health checks succeed
+    return {"ok": True}
+
 # ---------------------
 # Pydantic models
 # ---------------------
@@ -1800,14 +1819,14 @@ class LoginRequest(BaseModel):
 
 class RelationshipSetRequest(BaseModel):
     other_user_id: str
-    relation: str  # daughter, son, mother, father, sister, brother, wife, husband, friend
+    relation: str
 
 class JournalAddRequest(BaseModel):
     content: str
     consent: bool
 
 # ---------------------
-# HTML UI (login + users + relationships + multi chat + AI toggle + JOURNAL)
+# HTML UI (same as your enhanced version)
 # ---------------------
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -2228,9 +2247,13 @@ document.addEventListener('DOMContentLoaded', ()=>{
 # ---------------------
 # Auth routes
 # ---------------------
-def require_api_key(x_api_key: str = Header(...)):
-    if PUBLIC_UI_API_KEY and PUBLIC_UI_API_KEY.lower() != "disabled":
-        if x_api_key != PUBLIC_UI_API_KEY:
+from typing import Optional as _Optional
+
+def require_api_key(x_api_key: _Optional[str] = Header(None)):
+    expected = (PUBLIC_UI_API_KEY or "").strip()
+    # If PUBLIC_UI_API_KEY empty or "disabled", skip the check
+    if expected and expected.lower() != "disabled":
+        if x_api_key != expected:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
 @app.post("/auth/signup")
@@ -2321,15 +2344,24 @@ async def rel_get(other_id: str, sess=Depends(require_session), _: None = Depend
     return {"relation": (r or {}).get("relation")}
 
 # ---------------------
-# Core AI pieces (preprocess + history + traits + greeting)
+# Core AI pieces
 # ---------------------
 def preprocess_input(user_input: str) -> str:
     try:
         doc = nlp(user_input)
-        key_terms = [t.text.lower() for t in doc if t.pos_ in ["NOUN", "VERB"] and not t.is_stop]
+        key_terms = []
+        for t in doc:
+            if hasattr(t, "pos_") and hasattr(t, "is_stop"):
+                if t.pos_ in ["NOUN", "VERB"] and not t.is_stop:
+                    key_terms.append(t.text.lower())
+            else:
+                key_terms.append(t.text.lower())
         extra_terms = []
         for term in key_terms:
-            syns = wordnet.synsets(term)
+            try:
+                syns = wordnet.synsets(term)
+            except Exception:
+                syns = []
             synonyms = set()
             for syn in syns:
                 for lemma in syn.lemmas():
@@ -2375,8 +2407,9 @@ async def get_recent_conversation_history(speaker_id: str, target_id: str, limit
 
 async def generate_personality_traits(user_id: str) -> dict:
     await get_mongo_client()
-    convs = [doc async for doc in conversations_col.find({"user_id": {"$elemMatch": {"$eq": user_id}}}).sort("timestamp", -1).limit(500)]
-    journals = [doc async for doc in journals_col.find({"user_id": {"$in":[user_id,[user_id]]}}).sort("timestamp", -1).limit(500)]
+    # Simpler, correct membership queries for array field
+    convs = [doc async for doc in conversations_col.find({"user_id": user_id}).sort("timestamp", -1).limit(500)]
+    journals = [doc async for doc in journals_col.find({"user_id": user_id}).sort("timestamp", -1).limit(500)]
     data_text = "\n".join([c.get("content","") for c in convs] + [j.get("content","") for j in journals])[:1000]
     if not data_text:
         return {"core_traits": {}, "sub_traits": []}
@@ -2405,7 +2438,7 @@ async def generate_personality_traits(user_id: str) -> dict:
                 max_tokens=700, temperature=0.7
             )
             txt = resp.choices[0].message.content.strip()
-            txt = re.sub(r'^```json\\s*|\\s*```$', '', txt, flags=re.MULTILINE).strip()
+            txt = re.sub(r'^```json\s*|\s*```$', '', txt, flags=re.MULTILINE).strip()
             traits = json.loads(txt)
             if "core_traits" in traits and "sub_traits" in traits:
                 if isinstance(traits["core_traits"], list):
@@ -2469,7 +2502,7 @@ async def get_greeting_and_tone(bot_role: str, target_id: str) -> Tuple[str,str]
                 ], max_tokens=100, temperature=0.5
             )
             txt = resp.choices[0].message.content.strip()
-            txt = re.sub(r'^```json\\s*|\\s*```$','',txt, flags=re.MULTILINE).strip()
+            txt = re.sub(r'^```json\s*|\s*```$','',txt, flags=re.MULTILINE).strip()
             obj = json.loads(txt)
             if "greeting" in obj and "tone" in obj:
                 greeting, tone = obj["greeting"], obj["tone"]
@@ -2507,16 +2540,16 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
         if not item_id or not item_type: continue
         col = conversations_col if item_type=="conversation" else journals_col
         id_field = "conversation_id" if item_type=="conversation" else "entry_id"
-        q = {id_field:item_id, "user_id":[user_id] if item_type=="journal" else {"$in":[[speaker_id,user_id],[user_id,speaker_id]]}}
+        q = {id_field:item_id, "user_id": user_id}
         base = await col.find_one(q)
-        if not base: 
+        if not base:
             await embeddings_col.delete_one({"item_id": item_id, "item_type": item_type})
             continue
         if item_type=="journal":
             base["speaker_name"] = target_name
 
         adjusted = 1.0 - score
-        if item_type=="journal" and user_id in md.get("user_id", []): adjusted += 0.9
+        if item_type=="journal": adjusted += 0.9
         elif md.get("speaker_id")==speaker_id or md.get("target_id")==user_id: adjusted += 0.7
         if speaker_name.lower() in base.get("content","").lower() or target_name.lower() in base.get("content","").lower():
             adjusted += 0.3
@@ -2551,7 +2584,7 @@ async def should_include_memories(user_input: str, speaker_id: str, user_id: str
     return (len(rel)>0), rel[:3]
 
 # ---------------------
-# Timestamp-aware initialize_bot (prevents false “you asked this before”)
+# initialize_bot (timestamp-aware, your improved logic)
 # ---------------------
 async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_input: str) -> Tuple[str,str,bool]:
     sp = await users_col.find_one({"user_id": speaker_id})
@@ -2561,14 +2594,12 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_in
     traits = await generate_personality_traits(target_id)
     recent = await get_recent_conversation_history(speaker_id, target_id)
 
-    # build history but EXCLUDE the immediate current input if it matches the last message
     history_for_prompt = recent[:]
     if recent:
         last = recent[-1]
         if last.get("content","").strip() == user_input.strip():
             history_for_prompt = recent[:-1]
 
-    # only allow “you asked this before” if a truly earlier message is highly similar
     allow_repeat_ref = False
     try:
         loop = asyncio.get_event_loop()
@@ -2612,42 +2643,26 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_in
     sp_name = (sp or {}).get("display_name") or (sp or {}).get("username") or speaker_id
     tg_name = (tg or {}).get("display_name") or (tg or {}).get("username") or target_id
 
+    base_prompt = f"""
+    You are {tg_name}, responding as an AI Twin to {sp_name}, their {bot_role}.
+    Use a {tone} tone and reflect your personality: {trait_str}.
+
+    Earlier conversation (timestamps included, excludes the current message):
+    {hist_text}
+
+    {rails}
+
+    - {'Start with "' + greeting + '" if no earlier messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
+    - Keep it short (2–3 sentences), natural, and personalized.
+    Current user input: {user_input}
+
+    Respond directly to the Current user input above.
+    """
+
     if include:
-        prompt = f"""
-        You are {tg_name}, responding as an AI Twin to {sp_name}, their {bot_role}.
-        Use a {tone} tone and reflect your personality: {trait_str}.
+        base_prompt = base_prompt.replace("{rails}\n\n", "{rails}\n\nPotentially relevant memories:\n" + mems_text + "\n\n")
 
-        Earlier conversation (timestamps included, excludes the current message):
-        {hist_text}
-
-        Potentially relevant memories:
-        {mems_text}
-
-        {rails}
-
-        - {'Start with "' + greeting + '" if no earlier messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
-        - Keep it short (2–3 sentences), natural, and personalized.
-        Current user input: {user_input}
-
-        Respond directly to the Current user input above.
-        """
-    else:
-        prompt = f"""
-        You are {tg_name}, responding as an AI Twin to {sp_name}, their {bot_role}.
-        Use a {tone} tone and reflect your personality: {trait_str}.
-
-        Earlier conversation (timestamps included, excludes the current message):
-        {hist_text}
-
-        {rails}
-
-        - {'Start with "' + greeting + '" if no earlier messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
-        - Keep it short (2–3 sentences), natural, and personalized.
-        Current user input: {user_input}
-
-        Respond directly to the Current user input above.
-        """
-    return prompt, greeting, use_greeting
+    return base_prompt, greeting, use_greeting
 
 async def generate_response(prompt: str, user_input: str, greeting: str, use_greeting: bool) -> str:
     try:
@@ -2670,7 +2685,7 @@ async def generate_response(prompt: str, user_input: str, greeting: str, use_gre
     return f"{greeting}, sounds cool! What's up?" if use_greeting else "Sounds cool! What's up?"
 
 # ---------------------
-# Save message helper (used by HTTP & WS)
+# Save message helper
 # ---------------------
 async def save_and_embed_message(speaker_id: str, target_id: str, text: str, source: str) -> dict:
     await get_mongo_client()
@@ -2695,7 +2710,6 @@ async def save_and_embed_message(speaker_id: str, target_id: str, text: str, sou
     }
     await conversations_col.insert_one(doc)
 
-    # embed & store
     processed = preprocess_input(text)
     loop = asyncio.get_event_loop()
     emb = await loop.run_in_executor(None, lambda: embeddings.embed_query(processed))
@@ -2731,7 +2745,6 @@ async def send_message(req: MessageRequest, sess=Depends(require_api_and_session
     if sess["user"]["user_id"] != req.speaker_id:
         raise HTTPException(status_code=403, detail="Sender mismatch")
     await save_and_embed_message(req.speaker_id, req.target_id, req.user_input, source="human")
-    # If target has AI enabled, generate immediate response
     tg = await users_col.find_one({"user_id": req.target_id})
     if tg and tg.get("ai_enabled", False):
         prompt, greeting, use_greeting = await initialize_bot(req.speaker_id, req.target_id, req.bot_role, req.user_input)
@@ -2743,9 +2756,7 @@ async def send_message(req: MessageRequest, sess=Depends(require_api_and_session
 @app.get("/conversations/with/{other_id}")
 async def history_with(other_id: str, limit: int = 30, sess=Depends(require_api_and_session)):
     me = sess["user"]["user_id"]
-    cur = conversations_col.find({
-        "user_id": {"$all":[me, other_id]}
-    }).sort("timestamp",-1).limit(limit)
+    cur = conversations_col.find({"user_id": {"$all":[me, other_id]}}).sort("timestamp",-1).limit(limit)
     out = []
     async for c in cur:
         out.append({
@@ -2775,7 +2786,6 @@ async def journals_add(req: JournalAddRequest, sess=Depends(require_api_and_sess
         "timestamp": now
     }
     await journals_col.insert_one(doc)
-    # change stream will embed; do a best-effort immediate embed too
     try:
         await process_new_entry(item_id=entry_id, item_type="journal", content=doc["content"], user_id=doc["user_id"])
     except Exception:
@@ -2785,7 +2795,7 @@ async def journals_add(req: JournalAddRequest, sess=Depends(require_api_and_sess
 @app.get("/journals/list")
 async def journals_list(limit: int = 20, sess=Depends(require_api_and_session)):
     me = sess["user"]["user_id"]
-    cur = journals_col.find({"user_id": {"$in":[me,[me]]}}).sort("timestamp",-1).limit(limit)
+    cur = journals_col.find({"user_id": me}).sort("timestamp",-1).limit(limit)
     out = []
     async for j in cur:
         out.append({
@@ -2821,9 +2831,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg.get("type") == "chat":
                 to = msg["to"]
                 text = msg["text"]
-                # persist sender message
                 saved = await save_and_embed_message(user_id, to, text, source="human")
-                # forward to recipient if online
                 await manager.send_to(to, {"type":"chat","from": user_id, "payload":{
                     "speaker_id": saved["speaker_id"],
                     "target_id": saved["target_id"],
@@ -2831,7 +2839,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     "source": "human",
                     "timestamp": saved["timestamp"].isoformat()
                 }})
-                # AI proxy?
                 tgt = await users_col.find_one({"user_id": to})
                 if tgt and tgt.get("ai_enabled", False):
                     prompt, greeting, use_greeting = await initialize_bot(user_id, to, "friend", text)
@@ -2851,7 +2858,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await manager.broadcast_presence()
 
 # ---------------------
-# Change streams (conversations + journals)
+# Change streams
 # ---------------------
 async def process_new_entry(item_id: str, item_type: str, content: str, user_id: list,
                             speaker_id: Optional[str] = None, speaker_name: Optional[str] = None,
@@ -2896,8 +2903,8 @@ async def watch_conversations():
                             speaker_id=doc.get("speaker_id"), speaker_name=doc.get("speaker_name"),
                             target_id=doc.get("target_id"), target_name=doc.get("target_name")
                         )
-        except Exception as e:
-            await errors_col.insert_one({"error": str(e), "collection": "conversations", "timestamp": datetime.now(pytz.UTC)})
+        except Exception:
+            await errors_col.insert_one({"error": "watch_conversations error", "timestamp": datetime.now(pytz.UTC)})
             await asyncio.sleep(5)
 
 async def watch_journals():
@@ -2908,8 +2915,8 @@ async def watch_journals():
                 async for change in stream:
                     doc = change["fullDocument"]
                     await process_new_entry(item_id=doc["entry_id"], item_type="journal", content=doc["content"], user_id=doc["user_id"])
-        except Exception as e:
-            await errors_col.insert_one({"error": str(e), "collection": "journal_entries", "timestamp": datetime.now(pytz.UTC)})
+        except Exception:
+            await errors_col.insert_one({"error": "watch_journals error", "timestamp": datetime.now(pytz.UTC)})
             await asyncio.sleep(5)
 
 async def watch_collections():
@@ -2993,18 +3000,18 @@ async def verify_data():
     logger.info(f"DB counts: {counts}")
 
 async def initialize_db():
-    # dev/demo only: re-seed
-    await clear_database()
-    await populate_users()
-    await populate_conversations()
-    await populate_journals()
-    await verify_data()
+    if SEED_DEMO:
+        await clear_database()
+        await populate_users()
+        await populate_conversations()
+        await populate_journals()
+        await verify_data()
     await initialize_faiss_store()
 
 # ---------------------
-# Run
+# Run (local only)
 # ---------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, proxy_headers=True, timeout_keep_alive=70)
 
