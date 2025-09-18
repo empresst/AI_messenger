@@ -1640,9 +1640,6 @@
 
 
 
-
-
-
 import os
 import json
 import re
@@ -1979,7 +1976,7 @@ async def healthz():
 class MessageRequest(BaseModel):
     speaker_id: str
     target_id: str
-    bot_role: str
+    bot_role: Optional[str] = None
     user_input: str
 
 class MessageResponse(BaseModel):
@@ -2004,7 +2001,7 @@ class JournalAddRequest(BaseModel):
     consent: bool
 
 # ---------------------
-# HTML UI (same as your enhanced version)
+# HTML UI (same as your enhanced version, with tiny fix: do not force bot_role)
 # ---------------------
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -2293,7 +2290,11 @@ async function sendTo(other_id){
     btn.disabled = false;
   }else{
     try{
-      const res = await req('/send_message','POST', {speaker_id: ME.user_id, target_id: other_id, bot_role: 'friend', user_input: text});
+      const res = await req('/send_message','POST', {
+        speaker_id: ME.user_id,
+        target_id: other_id,
+        user_input: text
+      });
       // If server returned an AI reply (HTTP path), append it
       if(res && res.response && res.response !== 'Sent.'){
         appendMsg(other_id, {content: res.response, timestamp: new Date().toISOString(), speaker_id: other_id, source:'ai_twin'});
@@ -2505,12 +2506,46 @@ async def users_list(sess=Depends(require_session), _: None = Depends(require_ap
         })
     return {"users": users}
 
+# --- Relationship utils (NEW) ---
+INVERSE_REL = {
+    "mother": "son",
+    "father": "son",
+    "son": "father",
+    "daughter": "mother",
+    "sister": "brother",
+    "brother": "sister",
+    "wife": "husband",
+    "husband": "wife",
+    "friend": "friend"
+}
+
+async def resolve_target_role_for_reply(speaker_id: str, target_id: str) -> str:
+    """
+    Determine the role of the target relative to the speaker, from target's perspective.
+    The target is the one generating the reply, so we need how *target* views *speaker*.
+    """
+    await get_mongo_client()
+    doc = await relationships_col.find_one({"user_id": target_id, "other_user_id": speaker_id})
+    role = (doc or {}).get("relation", "").strip().lower()
+    return role if role else "friend"
+
 @app.post("/relationships/set")
 async def rel_set(req: RelationshipSetRequest, sess=Depends(require_session), _: None = Depends(require_api_key)):
     me_id = sess["user"]["user_id"]
+    now = datetime.now(pytz.UTC)
+    rel = req.relation.strip().lower()
+
+    # forward: me -> other
     await relationships_col.update_one(
         {"user_id": me_id, "other_user_id": req.other_user_id},
-        {"$set": {"relation": req.relation, "updated_at": datetime.now(pytz.UTC)}},
+        {"$set": {"relation": rel, "updated_at": now}},
+        upsert=True
+    )
+    # inverse: other -> me
+    inv = INVERSE_REL.get(rel, "friend")
+    await relationships_col.update_one(
+        {"user_id": req.other_user_id, "other_user_id": me_id},
+        {"$set": {"relation": inv, "updated_at": now}},
         upsert=True
     )
     return {"ok": True}
@@ -2585,7 +2620,6 @@ async def get_recent_conversation_history(speaker_id: str, target_id: str, limit
 
 async def generate_personality_traits(user_id: str) -> dict:
     await get_mongo_client()
-    # Simpler, correct membership queries for array field
     convs = [doc async for doc in conversations_col.find({"user_id": user_id}).sort("timestamp", -1).limit(500)]
     journals = [doc async for doc in journals_col.find({"user_id": user_id}).sort("timestamp", -1).limit(500)]
     data_text = "\n".join([c.get("content","") for c in convs] + [j.get("content","") for j in journals])[:1000]
@@ -2659,7 +2693,7 @@ async def get_greeting_and_tone(bot_role: str, target_id: str) -> Tuple[str,str]
         "father": ("Hey, kid", "warm, supportive"),
         "sister": ("Yo, sis", "playful, casual"),
         "brother": ("Yo, bro", "playful, casual"),
-        "wife": ("Hey, love", "affectionate, conversational"),
+        "wife": ("Hey, hon", "affectionate, conversational"),
         "husband": ("Hey, hon", "affectionate, conversational"),
         "friend": ("Hey, what's good?", "casual, friendly")
     }
@@ -2762,13 +2796,19 @@ async def should_include_memories(user_input: str, speaker_id: str, user_id: str
     return (len(rel)>0), rel[:3]
 
 # ---------------------
-# initialize_bot (timestamp-aware, your improved logic)
+# initialize_bot (role auto-detect)
 # ---------------------
-async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_input: str) -> Tuple[str,str,bool]:
+async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str], user_input: str) -> Tuple[str,str,bool]:
     sp = await users_col.find_one({"user_id": speaker_id})
     tg = await users_col.find_one({"user_id": target_id})
     if not sp or not tg:
         raise ValueError("Invalid IDs")
+
+    # auto-resolve role if not provided or unhelpful
+    role_in = (bot_role or "").strip().lower()
+    if not role_in or role_in == "friend":
+        role_in = await resolve_target_role_for_reply(speaker_id, target_id)
+
     traits = await generate_personality_traits(target_id)
     recent = await get_recent_conversation_history(speaker_id, target_id)
 
@@ -2800,7 +2840,7 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_in
         last_ts = None
 
     use_greeting = (not history_for_prompt) or (datetime.now(pytz.UTC)-as_utc_aware(last_ts)).total_seconds()/60 > 30
-    greeting, tone = await get_greeting_and_tone("friend" if not bot_role else bot_role, target_id)
+    greeting, tone = await get_greeting_and_tone(role_in, target_id)
 
     include, mems = await should_include_memories(user_input, speaker_id, target_id)
     mems_text = "No relevant memories."
@@ -2822,7 +2862,7 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_in
     tg_name = (tg or {}).get("display_name") or (tg or {}).get("username") or target_id
 
     base_prompt = f"""
-    You are {tg_name}, responding as an AI Twin to {sp_name}, their {bot_role}.
+    You are {tg_name}, responding as an AI Twin to {sp_name}, their {role_in}.
     Use a {tone} tone and reflect your personality: {trait_str}.
 
     Earlier conversation (timestamps included, excludes the current message):
@@ -2925,7 +2965,8 @@ async def send_message(req: MessageRequest, sess=Depends(require_api_and_session
     await save_and_embed_message(req.speaker_id, req.target_id, req.user_input, source="human")
     tg = await users_col.find_one({"user_id": req.target_id})
     if tg and tg.get("ai_enabled", False):
-        prompt, greeting, use_greeting = await initialize_bot(req.speaker_id, req.target_id, req.bot_role, req.user_input)
+        # Let server resolve role if not helpful
+        prompt, greeting, use_greeting = await initialize_bot(req.speaker_id, req.target_id, getattr(req, "bot_role", None), req.user_input)
         ai_text = await generate_response(prompt, req.user_input, greeting, use_greeting)
         await save_and_embed_message(req.target_id, req.speaker_id, ai_text, source="ai_twin")
         return MessageResponse(response=ai_text)
@@ -3019,7 +3060,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 }})
                 tgt = await users_col.find_one({"user_id": to})
                 if tgt and tgt.get("ai_enabled", False):
-                    prompt, greeting, use_greeting = await initialize_bot(user_id, to, "friend", text)
+                    # auto-role resolve
+                    prompt, greeting, use_greeting = await initialize_bot(user_id, to, None, text)
                     ai_text = await generate_response(prompt, text, greeting, use_greeting)
                     ai_saved = await save_and_embed_message(to, user_id, ai_text, source="ai_twin")
                     await manager.send_to(user_id, {"type":"ai","from": to, "payload":{
@@ -3192,4 +3234,3 @@ async def initialize_db():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT, proxy_headers=True, timeout_keep_alive=70)
-
