@@ -1,4 +1,3 @@
-# # app.py
 # import os
 # import json
 # import re
@@ -9,7 +8,6 @@
 # import threading
 # import asyncio
 # import logging
-# from dataclasses import dataclass
 # from datetime import datetime, timedelta
 # from typing import List, Optional, Tuple, Dict, Any
 # from contextlib import asynccontextmanager
@@ -23,6 +21,7 @@
 # from motor.motor_asyncio import AsyncIOMotorClient
 # from dotenv import load_dotenv
 
+# # LangChain / FAISS / OpenAI
 # from cachetools import TTLCache
 # from langchain_openai import OpenAIEmbeddings
 # from langchain_community.vectorstores import FAISS
@@ -96,7 +95,6 @@
 # embedding_cache = TTLCache(maxsize=1000, ttl=3600)
 # embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY, model="text-embedding-3-small")
 # FAISS_DIR = "faiss_store_v1"
-
 # watcher_task: Optional[asyncio.Task] = None
 
 # def as_utc_aware(dt: Optional[datetime]) -> Optional[datetime]:
@@ -116,7 +114,7 @@
 #                 MONGODB_URI,
 #                 tls=True,
 #                 tlsAllowInvalidCertificates=True,
-#                 maxPoolSize=100,
+#                 maxPoolSize=50,
 #                 minPoolSize=5,
 #                 maxIdleTimeMS=30000,
 #                 tz_aware=True
@@ -283,11 +281,7 @@
 #         async with self.lock:
 #             ws = self.active.get(user_id)
 #         if ws:
-#             try:
-#                 await ws.send_json(data)
-#             except Exception:
-#                 # Socket might be closed; ignore
-#                 pass
+#             await ws.send_json(data)
 
 #     async def broadcast_presence(self):
 #         async with self.lock:
@@ -301,71 +295,6 @@
 #                 pass
 
 # manager = ConnectionManager()
-
-# # ---------------------
-# # AI Reply Dispatcher (per-target worker & queue)
-# # ---------------------
-# @dataclass
-# class _Job:
-#     from_user: str
-#     to_user: str
-#     text: str
-#     bot_role: str
-
-# class AiReplyDispatcher:
-#     def __init__(self):
-#         self.queues: Dict[str, asyncio.Queue] = {}
-#         self.workers: Dict[str, asyncio.Task] = {}
-#         self.lock = asyncio.Lock()
-
-#     async def enqueue(self, from_user: str, to_user: str, text: str, bot_role: str):
-#         async with self.lock:
-#             q = self.queues.get(to_user)
-#             if q is None:
-#                 q = asyncio.Queue(maxsize=200)
-#                 self.queues[to_user] = q
-#                 self.workers[to_user] = asyncio.create_task(self._worker(to_user, q))
-#         try:
-#             await q.put(_Job(from_user, to_user, text, bot_role))
-#         except asyncio.CancelledError:
-#             raise
-
-#     async def _worker(self, target_id: str, queue: asyncio.Queue):
-#         while True:
-#             job: _Job = await queue.get()
-#             try:
-#                 # Generate & send AI reply as "target_id" speaking to "from_user"
-#                 prompt, greeting, use_greeting = await initialize_bot(job.from_user, job.to_user, job.bot_role, job.text)
-#                 ai_text = await generate_response(prompt, job.text, greeting, use_greeting)
-
-#                 ai_saved = await save_and_embed_message(job.to_user, job.from_user, ai_text, source="ai_twin")
-
-#                 # Deliver only to the original sender (so replies don’t leak)
-#                 await manager.send_to(job.from_user, {
-#                     "type": "ai",
-#                     "from": job.to_user,
-#                     "payload": {
-#                         "speaker_id": ai_saved["speaker_id"],
-#                         "target_id": ai_saved["target_id"],
-#                         "content": ai_saved["content"],
-#                         "source": "ai_twin",
-#                         "timestamp": ai_saved["timestamp"].isoformat()
-#                     }
-#                 })
-#             except Exception as e:
-#                 # log and continue; do not crash worker
-#                 try:
-#                     await errors_col.insert_one({
-#                         "error": f"dispatcher_worker:{str(e)}",
-#                         "target_id": target_id,
-#                         "timestamp": datetime.now(pytz.UTC)
-#                     })
-#                 except Exception:
-#                     pass
-#             finally:
-#                 queue.task_done()
-
-# dispatcher = AiReplyDispatcher()
 
 # # ---------------------
 # # FastAPI app (+ healthcheck)
@@ -396,6 +325,7 @@
 
 # @app.get("/healthz")
 # async def healthz():
+#     # Keep this independent of DB/OpenAI so Render health checks succeed
 #     return {"ok": True}
 
 # # ---------------------
@@ -404,7 +334,7 @@
 # class MessageRequest(BaseModel):
 #     speaker_id: str
 #     target_id: str
-#     bot_role: str
+#     bot_role: Optional[str] = None
 #     user_input: str
 
 # class MessageResponse(BaseModel):
@@ -429,7 +359,7 @@
 #     consent: bool
 
 # # ---------------------
-# # HTML UI (same as yours)
+# # HTML UI (same as your enhanced version, with tiny fix: do not force bot_role)
 # # ---------------------
 # @app.get("/", response_class=HTMLResponse)
 # async def home():
@@ -718,7 +648,11 @@
 #     btn.disabled = false;
 #   }else{
 #     try{
-#       const res = await req('/send_message','POST', {speaker_id: ME.user_id, target_id: other_id, bot_role: 'friend', user_input: text});
+#       const res = await req('/send_message','POST', {
+#         speaker_id: ME.user_id,
+#         target_id: other_id,
+#         user_input: text
+#       });
 #       // If server returned an AI reply (HTTP path), append it
 #       if(res && res.response && res.response !== 'Sent.'){
 #         appendMsg(other_id, {content: res.response, timestamp: new Date().toISOString(), speaker_id: other_id, source:'ai_twin'});
@@ -847,13 +781,14 @@
 #     """
 #     return HTMLResponse(html)
 
-
 # # ---------------------
-# # Auth & API key
+# # Auth routes
 # # ---------------------
 # from typing import Optional as _Optional
+
 # def require_api_key(x_api_key: _Optional[str] = Header(None)):
 #     expected = (PUBLIC_UI_API_KEY or "").strip()
+#     # If PUBLIC_UI_API_KEY empty or "disabled", skip the check
 #     if expected and expected.lower() != "disabled":
 #         if x_api_key != expected:
 #             raise HTTPException(status_code=401, detail="Invalid API key")
@@ -929,12 +864,46 @@
 #         })
 #     return {"users": users}
 
+# # --- Relationship utils (NEW) ---
+# INVERSE_REL = {
+#     "mother": "son",
+#     "father": "son",
+#     "son": "father",
+#     "daughter": "mother",
+#     "sister": "brother",
+#     "brother": "sister",
+#     "wife": "husband",
+#     "husband": "wife",
+#     "friend": "friend"
+# }
+
+# async def resolve_target_role_for_reply(speaker_id: str, target_id: str) -> str:
+#     """
+#     Determine the role of the target relative to the speaker, from target's perspective.
+#     The target is the one generating the reply, so we need how *target* views *speaker*.
+#     """
+#     await get_mongo_client()
+#     doc = await relationships_col.find_one({"user_id": target_id, "other_user_id": speaker_id})
+#     role = (doc or {}).get("relation", "").strip().lower()
+#     return role if role else "friend"
+
 # @app.post("/relationships/set")
 # async def rel_set(req: RelationshipSetRequest, sess=Depends(require_session), _: None = Depends(require_api_key)):
 #     me_id = sess["user"]["user_id"]
+#     now = datetime.now(pytz.UTC)
+#     rel = req.relation.strip().lower()
+
+#     # forward: me -> other
 #     await relationships_col.update_one(
 #         {"user_id": me_id, "other_user_id": req.other_user_id},
-#         {"$set": {"relation": req.relation, "updated_at": datetime.now(pytz.UTC)}},
+#         {"$set": {"relation": rel, "updated_at": now}},
+#         upsert=True
+#     )
+#     # inverse: other -> me
+#     inv = INVERSE_REL.get(rel, "friend")
+#     await relationships_col.update_one(
+#         {"user_id": req.other_user_id, "other_user_id": me_id},
+#         {"$set": {"relation": inv, "updated_at": now}},
 #         upsert=True
 #     )
 #     return {"ok": True}
@@ -1082,7 +1051,7 @@
 #         "father": ("Hey, kid", "warm, supportive"),
 #         "sister": ("Yo, sis", "playful, casual"),
 #         "brother": ("Yo, bro", "playful, casual"),
-#         "wife": ("Hey, love", "affectionate, conversational"),
+#         "wife": ("Hey, hon", "affectionate, conversational"),
 #         "husband": ("Hey, hon", "affectionate, conversational"),
 #         "friend": ("Hey, what's good?", "casual, friendly")
 #     }
@@ -1115,7 +1084,7 @@
 #     return greeting, tone
 
 # # ---------------------
-# # RAG: memories
+# # RAG: memories (convos + journals)
 # # ---------------------
 # async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str, speaker_name: str, max_memories: int = 5) -> List[dict]:
 #     global faiss_store
@@ -1185,13 +1154,19 @@
 #     return (len(rel)>0), rel[:3]
 
 # # ---------------------
-# # initialize_bot / generate_response
+# # initialize_bot (role auto-detect)
 # # ---------------------
-# async def initialize_bot(speaker_id: str, target_id: str, bot_role: str, user_input: str) -> Tuple[str,str,bool]:
+# async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str], user_input: str) -> Tuple[str,str,bool]:
 #     sp = await users_col.find_one({"user_id": speaker_id})
 #     tg = await users_col.find_one({"user_id": target_id})
 #     if not sp or not tg:
 #         raise ValueError("Invalid IDs")
+
+#     # auto-resolve role if not provided or unhelpful
+#     role_in = (bot_role or "").strip().lower()
+#     if not role_in or role_in == "friend":
+#         role_in = await resolve_target_role_for_reply(speaker_id, target_id)
+
 #     traits = await generate_personality_traits(target_id)
 #     recent = await get_recent_conversation_history(speaker_id, target_id)
 
@@ -1223,7 +1198,7 @@
 #         last_ts = None
 
 #     use_greeting = (not history_for_prompt) or (datetime.now(pytz.UTC)-as_utc_aware(last_ts)).total_seconds()/60 > 30
-#     greeting, tone = await get_greeting_and_tone("friend" if not bot_role else bot_role, target_id)
+#     greeting, tone = await get_greeting_and_tone(role_in, target_id)
 
 #     include, mems = await should_include_memories(user_input, speaker_id, target_id)
 #     mems_text = "No relevant memories."
@@ -1245,7 +1220,7 @@
 #     tg_name = (tg or {}).get("display_name") or (tg or {}).get("username") or target_id
 
 #     base_prompt = f"""
-#     You are {tg_name}, responding as an AI Twin to {sp_name}, their {bot_role}.
+#     You are {tg_name}, responding as an AI Twin to {sp_name}, their {role_in}.
 #     Use a {tone} tone and reflect your personality: {trait_str}.
 
 #     Earlier conversation (timestamps included, excludes the current message):
@@ -1277,15 +1252,12 @@
 #         )
 #         text = resp.choices[0].message.content.strip()
 #         if len(text.split()) >= 4 and ((use_greeting and text.lower().startswith(greeting.lower())) or not use_greeting):
-#             parts = text.split('. ')
-#             text = '. '.join([p for p in parts if p][:3]).strip()
+#             parts = text.split('. ')[:3]
+#             text = '. '.join([p for p in parts if p]).strip()
 #             if text and not text.endswith('.'): text += '.'
 #             return text
 #     except Exception as e:
-#         try:
-#             await errors_col.insert_one({"error": str(e), "input": user_input, "timestamp": datetime.now(pytz.UTC)})
-#         except Exception:
-#             pass
+#         await errors_col.insert_one({"error": str(e), "input": user_input, "timestamp": datetime.now(pytz.UTC)})
 #     return f"{greeting}, sounds cool! What's up?" if use_greeting else "Sounds cool! What's up?"
 
 # # ---------------------
@@ -1339,7 +1311,7 @@
 #     return doc
 
 # # ---------------------
-# # HTTP Chat (non-blocking for AI)
+# # HTTP Chat
 # # ---------------------
 # def require_api_and_session(sess=Depends(require_session), _: None = Depends(require_api_key)):
 #     return sess
@@ -1348,25 +1320,14 @@
 # async def send_message(req: MessageRequest, sess=Depends(require_api_and_session)):
 #     if sess["user"]["user_id"] != req.speaker_id:
 #         raise HTTPException(status_code=403, detail="Sender mismatch")
-
-#     # Save sender message
-#     saved = await save_and_embed_message(req.speaker_id, req.target_id, req.user_input, source="human")
-
-#     # Push to recipient if online (human)
-#     await manager.send_to(req.target_id, {"type":"chat","from": req.speaker_id, "payload":{
-#         "speaker_id": saved["speaker_id"],
-#         "target_id": saved["target_id"],
-#         "content": saved["content"],
-#         "source": "human",
-#         "timestamp": saved["timestamp"].isoformat()
-#     }})
-
-#     # If target has AI enabled, enqueue reply (do NOT block this HTTP call)
-#     tgt = await users_col.find_one({"user_id": req.target_id})
-#     if tgt and tgt.get("ai_enabled", False):
-#         await dispatcher.enqueue(from_user=req.speaker_id, to_user=req.target_id, text=req.user_input, bot_role=req.bot_role)
-
-#     # Always return quickly
+#     await save_and_embed_message(req.speaker_id, req.target_id, req.user_input, source="human")
+#     tg = await users_col.find_one({"user_id": req.target_id})
+#     if tg and tg.get("ai_enabled", False):
+#         # Let server resolve role if not helpful
+#         prompt, greeting, use_greeting = await initialize_bot(req.speaker_id, req.target_id, getattr(req, "bot_role", None), req.user_input)
+#         ai_text = await generate_response(prompt, req.user_input, greeting, use_greeting)
+#         await save_and_embed_message(req.target_id, req.speaker_id, ai_text, source="ai_twin")
+#         return MessageResponse(response=ai_text)
 #     return MessageResponse(response="Sent.")
 
 # @app.get("/conversations/with/{other_id}")
@@ -1422,7 +1383,7 @@
 #     return {"entries": out}
 
 # # ---------------------
-# # WebSocket Chat (non-blocking for AI)
+# # WebSocket Chat
 # # ---------------------
 # @app.websocket("/ws")
 # async def websocket_endpoint(websocket: WebSocket):
@@ -1447,9 +1408,7 @@
 #             if msg.get("type") == "chat":
 #                 to = msg["to"]
 #                 text = msg["text"]
-#                 # persist sender message
 #                 saved = await save_and_embed_message(user_id, to, text, source="human")
-#                 # forward to recipient if online
 #                 await manager.send_to(to, {"type":"chat","from": user_id, "payload":{
 #                     "speaker_id": saved["speaker_id"],
 #                     "target_id": saved["target_id"],
@@ -1457,10 +1416,19 @@
 #                     "source": "human",
 #                     "timestamp": saved["timestamp"].isoformat()
 #                 }})
-#                 # AI reply? enqueue, don't await here
 #                 tgt = await users_col.find_one({"user_id": to})
 #                 if tgt and tgt.get("ai_enabled", False):
-#                     await dispatcher.enqueue(from_user=user_id, to_user=to, text=text, bot_role="friend")
+#                     # auto-role resolve
+#                     prompt, greeting, use_greeting = await initialize_bot(user_id, to, None, text)
+#                     ai_text = await generate_response(prompt, text, greeting, use_greeting)
+#                     ai_saved = await save_and_embed_message(to, user_id, ai_text, source="ai_twin")
+#                     await manager.send_to(user_id, {"type":"ai","from": to, "payload":{
+#                         "speaker_id": ai_saved["speaker_id"],
+#                         "target_id": ai_saved["target_id"],
+#                         "content": ai_saved["content"],
+#                         "source": "ai_twin",
+#                         "timestamp": ai_saved["timestamp"].isoformat()
+#                     }})
 #     except WebSocketDisconnect:
 #         pass
 #     finally:
@@ -1468,7 +1436,7 @@
 #         await manager.broadcast_presence()
 
 # # ---------------------
-# # Change streams (unchanged)
+# # Change streams
 # # ---------------------
 # async def process_new_entry(item_id: str, item_type: str, content: str, user_id: list,
 #                             speaker_id: Optional[str] = None, speaker_name: Optional[str] = None,
@@ -1497,10 +1465,7 @@
 #             faiss_store.add_documents([Document(page_content=content, metadata=meta)])
 #             faiss_store.save_local(FAISS_DIR)
 #     except Exception as e:
-#         try:
-#             await errors_col.insert_one({"error": str(e), "item_id": item_id, "item_type": item_type, "timestamp": datetime.now(pytz.UTC)})
-#         except Exception:
-#             pass
+#         await errors_col.insert_one({"error": str(e), "item_id": item_id, "item_type": item_type, "timestamp": datetime.now(pytz.UTC)})
 
 # async def watch_conversations():
 #     while True:
@@ -1517,10 +1482,7 @@
 #                             target_id=doc.get("target_id"), target_name=doc.get("target_name")
 #                         )
 #         except Exception:
-#             try:
-#                 await errors_col.insert_one({"error": "watch_conversations error", "timestamp": datetime.now(pytz.UTC)})
-#             except Exception:
-#                 pass
+#             await errors_col.insert_one({"error": "watch_conversations error", "timestamp": datetime.now(pytz.UTC)})
 #             await asyncio.sleep(5)
 
 # async def watch_journals():
@@ -1532,10 +1494,7 @@
 #                     doc = change["fullDocument"]
 #                     await process_new_entry(item_id=doc["entry_id"], item_type="journal", content=doc["content"], user_id=doc["user_id"])
 #         except Exception:
-#             try:
-#                 await errors_col.insert_one({"error": "watch_journals error", "timestamp": datetime.now(pytz.UTC)})
-#             except Exception:
-#                 pass
+#             await errors_col.insert_one({"error": "watch_journals error", "timestamp": datetime.now(pytz.UTC)})
 #             await asyncio.sleep(5)
 
 # async def watch_collections():
@@ -1633,6 +1592,12 @@
 # if __name__ == "__main__":
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=PORT, proxy_headers=True, timeout_keep_alive=70)
+
+
+
+
+
+
 
 
 
@@ -2520,14 +2485,11 @@ INVERSE_REL = {
 }
 
 async def resolve_target_role_for_reply(speaker_id: str, target_id: str) -> str:
-    """
-    Determine the role of the target relative to the speaker, from target's perspective.
-    The target is the one generating the reply, so we need how *target* views *speaker*.
-    """
     await get_mongo_client()
-    doc = await relationships_col.find_one({"user_id": target_id, "other_user_id": speaker_id})
-    role = (doc or {}).get("relation", "").strip().lower()
-    return role if role else "friend"
+    rel = await relationships_col.find_one({"user_id": speaker_id, "other_user_id": target_id})
+    if rel and "relation" in rel:
+        return rel["relation"].lower()
+    return "friend"  
 
 @app.post("/relationships/set")
 async def rel_set(req: RelationshipSetRequest, sess=Depends(require_session), _: None = Depends(require_api_key)):
@@ -2620,34 +2582,56 @@ async def get_recent_conversation_history(speaker_id: str, target_id: str, limit
 
 async def generate_personality_traits(user_id: str) -> dict:
     await get_mongo_client()
+    
+    # Fetch conversations and journals
     convs = [doc async for doc in conversations_col.find({"user_id": user_id}).sort("timestamp", -1).limit(500)]
     journals = [doc async for doc in journals_col.find({"user_id": user_id}).sort("timestamp", -1).limit(500)]
-    data_text = "\n".join([c.get("content","") for c in convs] + [j.get("content","") for j in journals])[:1000]
+    data_text = "\n".join(
+        [f"[{doc['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}] {doc['content']}" for doc in convs] +
+        [f"[{doc['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}] (Journal) {doc['content']}" for doc in journals]
+    )[:1500]  # Increased limit for richer analysis
+    
     if not data_text:
         return {"core_traits": {}, "sub_traits": []}
+    
+    # Check for cached traits
     cached = await personalities_col.find_one({"user_id": user_id})
     if cached and "traits" in cached:
         return cached["traits"]
 
     u = await users_col.find_one({"user_id": user_id})
+    display_name = (u or {}).get("display_name", user_id)
+    
+    # Enhanced prompt for nuanced personality analysis
     big_five_prompt = f"""
-    Analyze this text from {(u or {}).get('display_name', user_id)}:
+    You are an expert psychologist analyzing the personality of {display_name} based on their conversation and journal entries.
+    Text data (conversations and journals, with timestamps):
     {data_text}
+    
     Return a JSON object with:
-    - "core_traits": 5 traits (Openness, Conscientiousness, Extraversion, Agreeableness, Neuroticism) with scores (0-100) and one-sentence explanations.
-    - "sub_traits": 3 unique traits with one-sentence descriptions.
-    Ensure the response is concise to fit within 700 tokens.
+    - "core_traits": 5 Big Five traits (Openness, Conscientiousness, Extraversion, Agreeableness, Neuroticism) with:
+      - "score" (0-100)
+      - "explanation" (one sentence describing evidence from the text)
+    - "sub_traits": 3-5 unique traits (e.g., humorous, empathetic, curious) with:
+      - "trait" (name of the trait)
+      - "description" (one sentence explaining how it manifests in the text)
+      - "tone" (e.g., playful, nurturing, serious, to guide conversational style)
+    
+    Ensure the traits reflect the user's conversational style, emotional tone, and context (e.g., family role, relationships).
+    Keep the response concise, within 700 tokens, and focus on specific evidence from the text.
     """
+    
     traits = None
     for attempt in range(3):
         try:
             resp = await (await get_openai_client()).chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role":"system","content":"You are a helpful assistant that generates personality traits."},
-                    {"role":"user","content":big_five_prompt}
+                    {"role": "system", "content": "You are an expert psychologist generating detailed personality traits based on text data."},
+                    {"role": "user", "content": big_five_prompt}
                 ],
-                max_tokens=700, temperature=0.7
+                max_tokens=700,
+                temperature=0.7
             )
             txt = resp.choices[0].message.content.strip()
             txt = re.sub(r'^```json\s*|\s*```$', '', txt, flags=re.MULTILINE).strip()
@@ -2656,23 +2640,30 @@ async def generate_personality_traits(user_id: str) -> dict:
                 if isinstance(traits["core_traits"], list):
                     traits["core_traits"] = {t["trait"]: {"score": t["score"], "explanation": t["explanation"]} for t in traits["core_traits"]}
                 break
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Trait generation attempt {attempt + 1} failed: {e}")
             if attempt == 2:
                 traits = {
                     "core_traits": {
-                        "Openness":{"score":50,"explanation":"Neutral openness."},
-                        "Conscientiousness":{"score":50,"explanation":"Neutral conscientiousness."},
-                        "Extraversion":{"score":50,"explanation":"Neutral extraversion."},
-                        "Agreeableness":{"score":50,"explanation":"Neutral agreeableness."},
-                        "Neuroticism":{"score":50,"explanation":"Neutral neuroticism."}
+                        "Openness": {"score": 50, "explanation": "Neutral openness due to limited data."},
+                        "Conscientiousness": {"score": 50, "explanation": "Neutral conscientiousness due to limited data."},
+                        "Extraversion": {"score": 50, "explanation": "Neutral extraversion due to limited data."},
+                        "Agreeableness": {"score": 50, "explanation": "Neutral agreeableness due to limited data."},
+                        "Neuroticism": {"score": 50, "explanation": "Neutral neuroticism due to limited data."}
                     },
-                    "sub_traits":[
-                        {"trait":"neutral","description":"Shows balanced behavior."},
-                        {"trait":"adaptable","description":"Adapts to context."},
-                        {"trait":"curious","description":"Engages with data."}
+                    "sub_traits": [
+                        {"trait": "neutral", "description": "Shows balanced behavior due to limited data.", "tone": "neutral"},
+                        {"trait": "adaptable", "description": "Adapts to context based on available data.", "tone": "flexible"},
+                        {"trait": "curious", "description": "Engages with available information.", "tone": "inquisitive"}
                     ]
                 }
-    await personalities_col.update_one({"user_id":user_id},{"$set":{"traits":traits}}, upsert=True)
+    
+    # Store traits in database
+    await personalities_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"traits": traits, "updated_at": datetime.now(pytz.UTC)}},
+        upsert=True
+    )
     return traits
 
 async def get_greeting_and_tone(bot_role: str, target_id: str) -> Tuple[str,str]:
@@ -2798,13 +2789,13 @@ async def should_include_memories(user_input: str, speaker_id: str, user_id: str
 # ---------------------
 # initialize_bot (role auto-detect)
 # ---------------------
-async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str], user_input: str) -> Tuple[str,str,bool]:
+async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str], user_input: str) -> Tuple[str, str, bool, dict]:
     sp = await users_col.find_one({"user_id": speaker_id})
     tg = await users_col.find_one({"user_id": target_id})
     if not sp or not tg:
         raise ValueError("Invalid IDs")
 
-    # auto-resolve role if not provided or unhelpful
+    # Auto-resolve role if not provided or unhelpful
     role_in = (bot_role or "").strip().lower()
     if not role_in or role_in == "friend":
         role_in = await resolve_target_role_for_reply(speaker_id, target_id)
@@ -2815,7 +2806,7 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
     history_for_prompt = recent[:]
     if recent:
         last = recent[-1]
-        if last.get("content","").strip() == user_input.strip():
+        if last.get("content", "").strip() == user_input.strip():
             history_for_prompt = recent[:-1]
 
     allow_repeat_ref = False
@@ -2839,13 +2830,13 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
         hist_text = "No earlier messages."
         last_ts = None
 
-    use_greeting = (not history_for_prompt) or (datetime.now(pytz.UTC)-as_utc_aware(last_ts)).total_seconds()/60 > 30
+    use_greeting = (not history_for_prompt) or (datetime.now(pytz.UTC) - as_utc_aware(last_ts)).total_seconds() / 60 > 30
     greeting, tone = await get_greeting_and_tone(role_in, target_id)
 
     include, mems = await should_include_memories(user_input, speaker_id, target_id)
     mems_text = "No relevant memories."
     if include and mems:
-        good = [m for m in mems if all(k in m for k in ["content","type","timestamp","speaker_name"])]
+        good = [m for m in mems if all(k in m for k in ["content", "type", "timestamp", "speaker_name"])]
         if good:
             mems_text = "\n".join([f"- [{m['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}] {m['content']} ({m['type']}, said by {m['speaker_name']})" for m in good])
 
@@ -2857,7 +2848,7 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
     - If NOT ALLOWED, avoid implying repetition; respond normally.
     """
 
-    trait_str = ', '.join([f"{k} ({v['explanation']})" for k,v in list(traits.get('core_traits', {}).items())[:3]]) or "balanced"
+    trait_str = ', '.join([f"{k} ({v['explanation']})" for k, v in list(traits.get('core_traits', {}).items())[:3]]) or "balanced"
     sp_name = (sp or {}).get("display_name") or (sp or {}).get("username") or speaker_id
     tg_name = (tg or {}).get("display_name") or (tg or {}).get("username") or target_id
 
@@ -2880,17 +2871,35 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
     if include:
         base_prompt = base_prompt.replace("{rails}\n\n", "{rails}\n\nPotentially relevant memories:\n" + mems_text + "\n\n")
 
-    return base_prompt, greeting, use_greeting
+    return base_prompt, greeting, use_greeting, traits
 
-async def generate_response(prompt: str, user_input: str, greeting: str, use_greeting: bool) -> str:
+async def generate_response(prompt: str, user_input: str, greeting: str, use_greeting: bool, speaker_id: str, target_id: str, role_in: str, traits: dict) -> str:
     try:
+        # Summarize memories for conciseness
+        include, mems = await should_include_memories(user_input, speaker_id, target_id)
+        mems_summary = "No relevant memories."
+        if include and mems:
+            good = [m for m in mems if all(k in m for k in ["content", "type", "timestamp", "speaker_name"])]
+            if good:
+                mems_summary = "\n".join([f"- {m['speaker_name']} said: '{m['content'][:50]}...' ({m['type']}, {m['timestamp'].strftime('%Y-%m-%d')})" for m in good[:3]])
+
+        # Enhance prompt with traits and memories
+        sub_traits = ", ".join([f"{t['trait']} ({t['tone']})" for t in traits.get('sub_traits', [])]) or "balanced"
+        enhanced_prompt = prompt.replace("{rails}\n\n", f"{rails}\n\nRelevant memories (summarized):\n{mems_summary}\n\n")
+        enhanced_prompt += f"""
+        - Match the response tone and style to {target_id}'s personality: {sub_traits}.
+        - Reflect their role as {role_in} and emotional tone from sub-traits.
+        - Respond in 2-3 sentences, staying natural and contextually relevant.
+        """
+
         resp = await (await get_openai_client()).chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role":"system","content":"You are an AI Twin responding in a personalized, casual manner."},
-                {"role":"user","content":prompt}
+                {"role": "system", "content": f"You are an AI Twin mimicking {target_id}'s personality, tone, and style based on their learned traits and memories."},
+                {"role": "user", "content": enhanced_prompt}
             ],
-            max_tokens=200, temperature=0.6
+            max_tokens=200,
+            temperature=0.6
         )
         text = resp.choices[0].message.content.strip()
         if len(text.split()) >= 4 and ((use_greeting and text.lower().startswith(greeting.lower())) or not use_greeting):
@@ -2965,12 +2974,60 @@ async def send_message(req: MessageRequest, sess=Depends(require_api_and_session
     await save_and_embed_message(req.speaker_id, req.target_id, req.user_input, source="human")
     tg = await users_col.find_one({"user_id": req.target_id})
     if tg and tg.get("ai_enabled", False):
-        # Let server resolve role if not helpful
-        prompt, greeting, use_greeting = await initialize_bot(req.speaker_id, req.target_id, getattr(req, "bot_role", None), req.user_input)
-        ai_text = await generate_response(prompt, req.user_input, greeting, use_greeting)
+        prompt, greeting, use_greeting, traits = await initialize_bot(req.speaker_id, req.target_id, getattr(req, "bot_role", None), req.user_input)
+        ai_text = await generate_response(prompt, req.user_input, greeting, use_greeting, req.speaker_id, req.target_id, getattr(req, "bot_role", None), traits)
         await save_and_embed_message(req.target_id, req.speaker_id, ai_text, source="ai_twin")
         return MessageResponse(response=ai_text)
     return MessageResponse(response="Sent.")
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    token = websocket.query_params.get("token")
+    user_id = websocket.query_params.get("user_id")
+    await get_mongo_client()
+    sess = await sessions_col.find_one({"token": token, "user_id": user_id})
+    if not sess:
+        await websocket.close(code=4401)
+        return
+
+    try:
+        await manager.connect(user_id, websocket)
+        await manager.broadcast_presence()
+        await users_col.update_one({"user_id": user_id}, {"$set": {"last_seen": datetime.now(pytz.UTC)}})
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+            except Exception:
+                continue
+            if msg.get("type") == "chat":
+                to = msg["to"]
+                text = msg["text"]
+                saved = await save_and_embed_message(user_id, to, text, source="human")
+                await manager.send_to(to, {"type": "chat", "from": user_id, "payload": {
+                    "speaker_id": saved["speaker_id"],
+                    "target_id": saved["target_id"],
+                    "content": saved["content"],
+                    "source": "human",
+                    "timestamp": saved["timestamp"].isoformat()
+                }})
+                tgt = await users_col.find_one({"user_id": to})
+                if tgt and tgt.get("ai_enabled", False):
+                    prompt, greeting, use_greeting, traits = await initialize_bot(user_id, to, None, text)
+                    ai_text = await generate_response(prompt, text, greeting, use_greeting, user_id, to, None, traits)
+                    ai_saved = await save_and_embed_message(to, user_id, ai_text, source="ai_twin")
+                    await manager.send_to(user_id, {"type": "ai", "from": to, "payload": {
+                        "speaker_id": ai_saved["speaker_id"],
+                        "target_id": ai_saved["target_id"],
+                        "content": ai_saved["content"],
+                        "source": "ai_twin",
+                        "timestamp": ai_saved["timestamp"].isoformat()
+                    }})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await manager.disconnect(user_id)
+        await manager.broadcast_presence()
 
 @app.get("/conversations/with/{other_id}")
 async def history_with(other_id: str, limit: int = 30, sess=Depends(require_api_and_session)):
@@ -3027,55 +3084,7 @@ async def journals_list(limit: int = 20, sess=Depends(require_api_and_session)):
 # ---------------------
 # WebSocket Chat
 # ---------------------
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    token = websocket.query_params.get("token")
-    user_id = websocket.query_params.get("user_id")
-    await get_mongo_client()
-    sess = await sessions_col.find_one({"token": token, "user_id": user_id})
-    if not sess:
-        await websocket.close(code=4401)
-        return
 
-    try:
-        await manager.connect(user_id, websocket)
-        await manager.broadcast_presence()
-        await users_col.update_one({"user_id": user_id}, {"$set":{"last_seen": datetime.now(pytz.UTC)}})
-        while True:
-            data = await websocket.receive_text()
-            try:
-                msg = json.loads(data)
-            except Exception:
-                continue
-            if msg.get("type") == "chat":
-                to = msg["to"]
-                text = msg["text"]
-                saved = await save_and_embed_message(user_id, to, text, source="human")
-                await manager.send_to(to, {"type":"chat","from": user_id, "payload":{
-                    "speaker_id": saved["speaker_id"],
-                    "target_id": saved["target_id"],
-                    "content": saved["content"],
-                    "source": "human",
-                    "timestamp": saved["timestamp"].isoformat()
-                }})
-                tgt = await users_col.find_one({"user_id": to})
-                if tgt and tgt.get("ai_enabled", False):
-                    # auto-role resolve
-                    prompt, greeting, use_greeting = await initialize_bot(user_id, to, None, text)
-                    ai_text = await generate_response(prompt, text, greeting, use_greeting)
-                    ai_saved = await save_and_embed_message(to, user_id, ai_text, source="ai_twin")
-                    await manager.send_to(user_id, {"type":"ai","from": to, "payload":{
-                        "speaker_id": ai_saved["speaker_id"],
-                        "target_id": ai_saved["target_id"],
-                        "content": ai_saved["content"],
-                        "source": "ai_twin",
-                        "timestamp": ai_saved["timestamp"].isoformat()
-                    }})
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await manager.disconnect(user_id)
-        await manager.broadcast_presence()
 
 # ---------------------
 # Change streams
@@ -3179,12 +3188,28 @@ async def batch_embed_texts(texts: List[str]):
 async def populate_conversations():
     now = datetime.now(pytz.UTC)
     convs = [
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user1","user2"], "speaker_id":"user1","speaker_name":"Nipa","target_id":"user2","target_name":"Nick","content":"Hey nick, ready for the project?","type":"user_input","source":"human","timestamp": now - timedelta(days=1)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user2","user1"], "speaker_id":"user2","speaker_name":"Nick","target_id":"user1","target_name":"Nipa","content":"Yeah, let's do this!","type":"user_input","source":"human","timestamp": now - timedelta(days=1, hours=1)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user3","user4"], "speaker_id":"user3","speaker_name":"Arif","target_id":"user4","target_name":"Diana","content":"Diana, got any weekend plans?","type":"user_input","source":"human","timestamp": now - timedelta(days=2)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user4","user3"], "speaker_id":"user4","speaker_name":"Diana","target_id":"user3","target_name":"Arif","content":"Just chilling, you?","type":"user_input","source":"human","timestamp": now - timedelta(days=2, hours=1)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user1","user3"], "speaker_id":"user1","speaker_name":"Nipa","target_id":"user3","target_name":"Arif","content":"Dad, I want to go to disney","type":"user_input","source":"human","timestamp": now - timedelta(hours=12)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user4","user2"], "speaker_id":"user4","speaker_name":"Diana","target_id":"user2","target_name":"Nick","content":"Nick, have you tried the new coffee shop yet?","type":"user_input","source":"human","timestamp": now - timedelta(hours=10)}
+        # Nipa (user1) to Nick (user2)
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user1", "user2"], "speaker_id": "user1", "speaker_name": "Nipa", "target_id": "user2", "target_name": "Nick", "content": "Nick, I found this amazing book about fantasy worlds—wanna read it with me?", "type": "user_input", "source": "human", "timestamp": now - timedelta(days=2)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user2", "user1"], "speaker_id": "user2", "speaker_name": "Nick", "target_id": "user1", "target_name": "Nipa", "content": "Yo, sis, only if it’s got epic battles! Got any new games to try?", "type": "user_input", "source": "human", "timestamp": now - timedelta(days=2, hours=1)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user1", "user2"], "speaker_id": "user1", "speaker_name": "Nipa", "target_id": "user2", "target_name": "Nick", "content": "I’m kinda nervous about my art presentation tomorrow—any tips?", "type": "user_input", "source": "human", "timestamp": now - timedelta(days=1)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user2", "user1"], "speaker_id": "user2", "speaker_name": "Nick", "target_id": "user1", "target_name": "Nipa", "content": "Chill, Nipa, just be yourself—you’ll crush it!", "type": "user_input", "source": "human", "timestamp": now - timedelta(days=1, hours=1)},
+        # Arif (user3) to Diana (user4)
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user3", "user4"], "speaker_id": "user3", "speaker_name": "Arif", "target_id": "user4", "target_name": "Diana", "content": "Hon, let’s plan a family picnic this weekend—maybe by the lake?", "type": "user_input", "source": "human", "timestamp": now - timedelta(days=3)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user4", "user3"], "speaker_id": "user4", "speaker_name": "Diana", "target_id": "user3", "target_name": "Arif", "content": "That sounds wonderful, Arif—let’s bring some homemade lemonade!", "type": "user_input", "source": "human", "timestamp": now - timedelta(days=3, hours=1)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user3", "user4"], "speaker_id": "user3", "speaker_name": "Arif", "target_id": "user4", "target_name": "Diana", "content": "Work’s been tough—any chance we can sneak away for a date night?", "type": "user_input", "source": "human", "timestamp": now - timedelta(days=2)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user4", "user3"], "speaker_id": "user4", "speaker_name": "Diana", "target_id": "user3", "target_name": "Arif", "content": "Oh, hon, let’s do it—maybe that new Italian place?", "type": "user_input", "source": "human", "timestamp": now - timedelta(days=2, hours=1)},
+        # Nipa (user1) to Arif (user3)
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user1", "user3"], "speaker_id": "user1", "speaker_name": "Nipa", "target_id": "user3", "target_name": "Arif", "content": "Dad, I’m stressed about my art project—can you help me brainstorm?", "type": "user_input", "source": "human", "timestamp": now - timedelta(hours=12)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user3", "user1"], "speaker_id": "user3", "speaker_name": "Arif", "target_id": "user1", "target_name": "Nipa", "content": "Nipa, let’s sketch out some ideas together—grab your pencils!", "type": "user_input", "source": "human", "timestamp": now - timedelta(hours=11)},
+        # Diana (user4) to Nick (user2)
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user4", "user2"], "speaker_id": "user4", "speaker_name": "Diana", "target_id": "user2", "target_name": "Nick", "content": "Nick, sweetie, have you finished your homework yet?", "type": "user_input", "source": "human", "timestamp": now - timedelta(hours=10)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user2", "user4"], "speaker_id": "user2", "speaker_name": "Nick", "target_id": "user4", "target_name": "Diana", "content": "Mom, almost done—just stuck on this math problem!", "type": "user_input", "source": "human", "timestamp": now - timedelta(hours=9)},
+        # Nick (user2) to Arif (user3)
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user2", "user3"], "speaker_id": "user2", "speaker_name": "Nick", "target_id": "user3", "target_name": "Arif", "content": "Dad, can we get a new gaming console? The old one’s lagging!", "type": "user_input", "source": "human", "timestamp": now - timedelta(hours=8)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user3", "user2"], "speaker_id": "user3", "speaker_name": "Arif", "target_id": "user2", "target_name": "Nick", "content": "Nick, let’s check the budget—maybe if you ace that test!", "type": "user_input", "source": "human", "timestamp": now - timedelta(hours=7)},
+        # Diana (user4) to Nipa (user1)
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user4", "user1"], "speaker_id": "user4", "speaker_name": "Diana", "target_id": "user1", "target_name": "Nipa", "content": "Nipa, want to bake some cookies tonight? It’ll be fun!", "type": "user_input", "source": "human", "timestamp": now - timedelta(hours=6)},
+        {"conversation_id": str(uuid.uuid4()), "user_id": ["user1", "user4"], "speaker_id": "user1", "speaker_name": "Nipa", "target_id": "user4", "target_name": "Diana", "content": "Yes, Mom, let’s make chocolate chip—my favorite!", "type": "user_input", "source": "human", "timestamp": now - timedelta(hours=5)}
     ]
     for c in convs:
         if not await conversations_col.find_one({"conversation_id": c["conversation_id"]}):
@@ -3192,23 +3217,61 @@ async def populate_conversations():
     embeddings_result = await batch_embed_texts([c["content"] for c in convs])
     docs = []
     for c, e in zip(convs, embeddings_result):
-        if e is not None and not await embeddings_col.find_one({"item_id": c["conversation_id"], "item_type":"conversation"}):
+        if e is not None and not await embeddings_col.find_one({"item_id": c["conversation_id"], "item_type": "conversation"}):
             docs.append({
-                "item_id": c["conversation_id"], "item_type":"conversation", "user_id": c["user_id"],
-                "content": c["content"], "embedding": e, "timestamp": c["timestamp"],
-                "speaker_id": c["speaker_id"], "speaker_name": c["speaker_name"],
-                "target_id": c["target_id"], "target_name": c["target_name"]
+                "item_id": c["conversation_id"],
+                "item_type": "conversation",
+                "user_id": c["user_id"],
+                "content": c["content"],
+                "embedding": e,
+                "timestamp": c["timestamp"],
+                "speaker_id": c["speaker_id"],
+                "speaker_name": c["speaker_name"],
+                "target_id": c["target_id"],
+                "target_name": c["target_name"]
             })
-    if docs: await embeddings_col.insert_many(docs)
+    if docs:
+        await embeddings_col.insert_many(docs)
 
 async def populate_journals():
     now = datetime.now(pytz.UTC)
-    j = {"entry_id": str(uuid.uuid4()), "user_id": ["user1"], "content":"I am in love with Jack", "timestamp": now - timedelta(hours=6)}
-    if not await journals_col.find_one({"entry_id": j["entry_id"]}):
-        await journals_col.insert_one(j)
-    emb = (await batch_embed_texts([j["content"]]))[0]
-    if emb is not None and not await embeddings_col.find_one({"item_id": j["entry_id"], "item_type":"journal"}):
-        await embeddings_col.insert_one({"item_id": j["entry_id"], "item_type":"journal", "user_id": j["user_id"], "content": j["content"], "embedding": emb, "timestamp": j["timestamp"]})
+    journals = [
+        # Nipa (user1)
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user1"], "content": "I’m so inspired by this fantasy novel—it feels like I’m in another world!", "timestamp": now - timedelta(hours=8)},
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user1"], "content": "Feeling nervous about my art presentation, but I’m excited to share my work.", "timestamp": now - timedelta(hours=6)},
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user1"], "content": "Sometimes I worry about fitting in at school, but Mom’s support makes it easier.", "timestamp": now - timedelta(hours=4)},
+        # Nick (user2)
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user2"], "content": "Just beat my high score in this new game—feeling unstoppable!", "timestamp": now - timedelta(hours=7)},
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user2"], "content": "School was annoying today—too much homework, not enough gaming time.", "timestamp": now - timedelta(hours=5)},        
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user2"], "content": "Kinda stoked about the science fair—might build a cool robot!", "timestamp": now - timedelta(hours=3)},
+        # Arif (user3)
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user3"], "content": "Work was stressful, but coming home to Diana and the kids is my safe haven.", "timestamp": now - timedelta(hours=9)},
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user3"], "content": "Thinking about planning a family camping trip—need to make time for it.", "timestamp": now - timedelta(hours=2)},
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user3"], "content": "Proud of Nipa’s art passion—she reminds me to stay creative too.", "timestamp": now - timedelta(hours=1)},
+        # Diana (user4)
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user4"], "content": "Nipa’s growing up so fast—it’s bittersweet watching her chase her dreams.", "timestamp": now - timedelta(hours=10)},
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user4"], "content": "Tried a new painting technique today—felt so alive creating something new!", "timestamp": now - timedelta(hours=4)},
+        {"entry_id": str(uuid.uuid4()), "user_id": ["user4"], "content": "Worried about Nick’s grades, but I know he’ll pull through with some encouragement.", "timestamp": now - timedelta(hours=2)}
+    ]
+    for j in journals:
+        if not await journals_col.find_one({"entry_id": j["entry_id"]}):
+            await journals_col.insert_one(j)
+    embeddings_result = await batch_embed_texts([j["content"] for j in journals])
+    docs = []
+    for j, e in zip(journals, embeddings_result):
+        if e is not None and not await embeddings_col.find_one({"item_id": j["entry_id"], "item_type": "journal"}):
+            docs.append({
+                "item_id": j["entry_id"],
+                "item_type": "journal",
+                "user_id": j["user_id"],
+                "content": j["content"],
+                "embedding": e,
+                "timestamp": j["timestamp"]
+            })
+    if docs:
+        await embeddings_col.insert_many(docs)
+
+
 
 async def verify_data():
     counts = {
@@ -3219,6 +3282,8 @@ async def verify_data():
     }
     logger.info(f"DB counts: {counts}")
 
+
+
 async def initialize_db():
     if SEED_DEMO:
         await clear_database()
@@ -3227,6 +3292,7 @@ async def initialize_db():
         await populate_journals()
         await verify_data()
     await initialize_faiss_store()
+
 
 # ---------------------
 # Run (local only)
