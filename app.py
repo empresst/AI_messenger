@@ -4704,12 +4704,14 @@ def require_api_and_session(sess=Depends(require_session), _: None = Depends(req
     return sess
 
 @app.post("/send_message", response_model=MessageResponse)
-async def send_message(req: MessageRequest, x_api_key: str = Header(...)):
+async def send_message(req: MessageRequest, sess=Depends(require_api_and_session)):
     global faiss_store
 
-    # --- API Key validation ---
-    if x_api_key != PUBLIC_UI_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    # The API key validation is now handled via Depends(require_api_key) inside require_api_and_session
+
+    # Add sender mismatch check for security
+    if sess["user"]["user_id"] != req.speaker_id:
+        raise HTTPException(status_code=403, detail="Sender mismatch")
 
     embedding_cache.clear()
     logger.info("Cleared embedding cache")
@@ -4744,13 +4746,12 @@ async def send_message(req: MessageRequest, x_api_key: str = Header(...)):
     except Exception as e:
         logger.error(f"send_message failed: {str(e)}")
         await get_mongo_client()
-        await errors_collection.insert_one({
+        await errors_col.insert_one({  # Fixed typo: errors_collection -> errors_col
             "error": str(e),
             "input": req.user_input,
-            "timestamp": datetime.utcnow()
+            "timestamp": datetime.now(pytz.UTC)  # Use consistent timezone-aware datetime
         })
         return MessageResponse(response="", error=str(e))
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
