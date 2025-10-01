@@ -4577,40 +4577,63 @@ async def initialize_bot(
 async def generate_response(prompt: str, user_input: str, greeting: str, use_greeting: bool, speaker_id: str, target_id: str, role_in: str, traits: dict) -> str:
     try:
         # Summarize memories for conciseness
-        include, mems = await should_include_memories(user_input, target_id, speaker_id)
+        include, mems = await should_include_memories(user_input, speaker_id, target_id)
         mems_summary = "No relevant memories."
         if include and mems:
             good = [m for m in mems if all(k in m for k in ["content", "type", "timestamp", "speaker_name"])]
             if good:
-                mems_summary = "\n".join([f"- {m['speaker_name']} said: '{m['content'][:50]}...' ({m['type']}, {m['timestamp'].strftime('%Y-%m-%d')})" for m in good[:3]])
+                mems_summary = "\n".join([
+                    f"- {m['speaker_name']}: '{m['content'][:50]}...' ({m['type']}, {m['timestamp'].strftime('%Y-%m-%d')})"
+                    for m in good[:2]
+                ])
 
-        # Enhance prompt with traits and memories
+        # Simplify prompt for speed and relevance
         sub_traits = ", ".join([f"{t['trait']} ({t['tone']})" for t in traits.get('sub_traits', [])]) or "balanced"
-        enhanced_prompt = prompt.replace("{rails}\n\n", f"{rails}\n\nRelevant memories (summarized):\n{mems_summary}\n\n")
-        enhanced_prompt += f"""
-        - Match the response tone and style to {speaker_id}'s personality: {sub_traits}.
-        - Reflect their role as {role_in} and emotional tone from sub-traits.
-        - Respond in 2-3 sentences, staying natural and contextually relevant.
+        enhanced_prompt = f"""
+        You are an AI Twin acting as {target_id}, a {role_in}, responding to {speaker_id}.
+        Reply to: "{user_input}"
+        - Use a {sub_traits} tone.
+        - Reference this context if relevant:
+        {mems_summary}
+        - {'Start with "' + greeting + '" if appropriate.' if use_greeting else 'No greeting.'}
+        - Keep it short (2-3 sentences), natural, and directly relevant to the input.
+        - Do not invent details.
         """
 
-        resp = await (await get_openai_client()).chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": f"You are an AI Twin mimicking {speaker_id}'s personality, tone, and style based on their learned traits and memories."},
-                {"role": "user", "content": enhanced_prompt}
-            ],
-            max_tokens=200,
-            temperature=0.6
-        )
-        text = resp.choices[0].message.content.strip()
-        if len(text.split()) >= 4 and ((use_greeting and text.lower().startswith(greeting.lower())) or not use_greeting):
-            parts = text.split('. ')[:3]
-            text = '. '.join([p for p in parts if p]).strip()
-            if text and not text.endswith('.'): text += '.'
-            return text
+        # API call with retries
+        for attempt in range(2):
+            try:
+                resp = await (await get_openai_client()).chat.completions.create(
+                    model="gpt-4o-mini",  # Faster model
+                    messages=[
+                        {"role": "system", "content": f"You are {target_id}, a {role_in} responding naturally."},
+                        {"role": "user", "content": enhanced_prompt}
+                    ],
+                    max_tokens=100,  # Reduced for speed
+                    temperature=0.7
+                )
+                text = resp.choices[0].message.content.strip()
+                if text and len(text.split()) >= 3:  # Ensure meaningful response
+                    parts = text.split('. ')[:3]
+                    text = '. '.join([p for p in parts if p]).strip()
+                    if text and not text.endswith('.'):
+                        text += '.'
+                    return text
+                logger.warning(f"Response too short on attempt {attempt + 1}: {text}")
+            except Exception as e:
+                logger.warning(f"API call failed on attempt {attempt + 1}: {e}")
+                if attempt == 1:
+                    raise e
+                await asyncio.sleep(0.5)
+
+        # Fallback if response is invalid
+        logger.warning(f"Invalid response for input: {user_input}")
+        return f"{greeting}, can you tell me more about that?" if use_greeting else f"Sorry, I didn't catch that—could you say more?"
+
     except Exception as e:
+        logger.error(f"generate_response failed: {str(e)}")
         await errors_col.insert_one({"error": str(e), "input": user_input, "timestamp": datetime.now(pytz.UTC)})
-    return f"{greeting}, sounds cool! What's up?" if use_greeting else "Sounds cool! What's up?"
+        return f"{greeting}, something's off—can you repeat that?" if use_greeting else "Something's off—can you repeat that?"
 
 # ---------------------
 # Save message helper
