@@ -3397,6 +3397,9 @@ embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY, model="text-embeddi
 FAISS_DIR = "faiss_store_v1"
 watcher_task: Optional[asyncio.Task] = None
 
+faiss_batch = []
+FAISS_BATCH_SIZE = 10  # Save to FAISS after 10 documents
+
 def as_utc_aware(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is None:
         return None
@@ -3601,14 +3604,32 @@ manager = ConnectionManager()
 # ---------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global watcher_task
+    global watcher_task, faiss_batch
     await initialize_db()
     watcher_task = asyncio.create_task(watch_collections())
+    async def periodic_faiss_save():
+        while True:
+            await asyncio.sleep(60)
+            with faiss_lock:
+                if faiss_batch and faiss_store is not None:
+                    try:
+                        faiss_store.add_documents(faiss_batch)
+                        faiss_store.save_local(FAISS_DIR)
+                        faiss_batch = []
+                    except Exception as e:
+                        logger.warning(f"Periodic FAISS save failed: {e}")
+    faiss_save_task = asyncio.create_task(periodic_faiss_save())
     yield
     if watcher_task:
         watcher_task.cancel()
         try:
             await watcher_task
+        except asyncio.CancelledError:
+            pass
+    if faiss_save_task:
+        faiss_save_task.cancel()
+        try:
+            await faiss_save_task
         except asyncio.CancelledError:
             pass
     if client:
@@ -4639,10 +4660,7 @@ async def generate_response(prompt: str, user_input: str, greeting: str, use_gre
 # Save message helper
 # ---------------------
 async def save_and_embed_message(speaker_id: str, target_id: str, text: str, source: str) -> dict:
-    """
-    Save a message to MongoDB, generate and store embeddings, and add to FAISS.
-    Supports both human and AI messages.
-    """
+    global faiss_batch
     await get_mongo_client()
     await ensure_faiss_store()
 
@@ -4672,11 +4690,9 @@ async def save_and_embed_message(speaker_id: str, target_id: str, text: str, sou
     # Save to MongoDB
     await conversations_col.insert_one(doc)
 
-    # --- Preprocess input asynchronously ---
+    # Generate embedding
     loop = asyncio.get_event_loop()
     processed_text = await loop.run_in_executor(None, preprocess_input, text)
-
-    # --- Generate embedding asynchronously ---
     embedding = await loop.run_in_executor(None, lambda: embeddings.embed_query(processed_text))
 
     # Save embedding to MongoDB
@@ -4696,7 +4712,7 @@ async def save_and_embed_message(speaker_id: str, target_id: str, text: str, sou
     except Exception as e:
         logger.warning(f"Failed to insert embedding: {e}")
 
-    # --- Add to FAISS safely ---
+    # Add to FAISS batch
     try:
         db_doc = Document(
             page_content=text,
@@ -4712,11 +4728,13 @@ async def save_and_embed_message(speaker_id: str, target_id: str, text: str, sou
             }
         )
         with faiss_lock:
-            faiss_store.add_documents([db_doc])
-            # Optional: consider batching save_local for efficiency
-            faiss_store.save_local(FAISS_DIR)
+            faiss_batch.append(db_doc)
+            if len(faiss_batch) >= FAISS_BATCH_SIZE:
+                faiss_store.add_documents(faiss_batch)
+                faiss_store.save_local(FAISS_DIR)
+                faiss_batch = []
     except Exception as e:
-        logger.warning(f"FAISS add/save failed: {e}")
+        logger.warning(f"FAISS add failed: {e}")
 
     return doc
 
@@ -4730,51 +4748,48 @@ def require_api_and_session(sess=Depends(require_session), _: None = Depends(req
 async def send_message(req: MessageRequest, sess=Depends(require_api_and_session)):
     global faiss_store
 
-    # The API key validation is now handled via Depends(require_api_key) inside require_api_and_session
-
-    # Add sender mismatch check for security
     if sess["user"]["user_id"] != req.speaker_id:
         raise HTTPException(status_code=403, detail="Sender mismatch")
-
-    embedding_cache.clear()
-    logger.info("Cleared embedding cache")
 
     logger.info(f"Processing message: speaker={req.speaker_id}, target={req.target_id}, role={req.bot_role}")
 
     try:
-        # --- Save user message ---
+        # Save user message
         user_doc = await save_and_embed_message(req.speaker_id, req.target_id, req.user_input, source="human")
 
-        # --- Check if target has AI enabled ---
+        # Check if target has AI enabled
         tg = await users_col.find_one({"user_id": req.target_id})
         if not tg or not tg.get("ai_enabled", False):
             return MessageResponse(response="Sent.")
 
-        # --- Initialize AI bot ---
-        prompt, greeting, use_greeting, traits = await initialize_bot(
-            req.speaker_id, req.target_id, getattr(req, "bot_role", None), req.user_input
-        )
+        # Initialize AI bot
+        try:
+            prompt, greeting, use_greeting, traits = await initialize_bot(
+                req.speaker_id, req.target_id, getattr(req, "bot_role", None), req.user_input
+            )
+        except Exception as e:
+            logger.error(f"Bot initialization failed: {str(e)}")
+            await errors_col.insert_one({"error": f"Bot init: {str(e)}", "input": req.user_input, "timestamp": datetime.now(pytz.UTC)})
+            return MessageResponse(response="Sent.", error="Failed to initialize AI response")
 
-        # --- Generate AI response ---
-        ai_text = await generate_response(
-            prompt, req.user_input, greeting, use_greeting,
-            req.speaker_id, req.target_id, getattr(req, "bot_role", None), traits
-        )
-
-        # --- Save AI response ---
-        ai_doc = await save_and_embed_message(req.target_id, req.speaker_id, ai_text, source="ai_twin")
-
-        return MessageResponse(response=ai_text)
+        # Generate AI response
+        try:
+            ai_text = await generate_response(
+                prompt, req.user_input, greeting, use_greeting,
+                req.speaker_id, req.target_id, getattr(req, "bot_role", None), traits
+            )
+            # Save AI response
+            await save_and_embed_message(req.target_id, req.speaker_id, ai_text, source="ai_twin")
+            return MessageResponse(response=ai_text)
+        except Exception as e:
+            logger.error(f"AI response generation failed: {str(e)}")
+            await errors_col.insert_one({"error": f"AI response: {str(e)}", "input": req.user_input, "timestamp": datetime.now(pytz.UTC)})
+            return MessageResponse(response="Sent.", error="AI response generation failed")
 
     except Exception as e:
         logger.error(f"send_message failed: {str(e)}")
-        await get_mongo_client()
-        await errors_col.insert_one({  # Fixed typo: errors_collection -> errors_col
-            "error": str(e),
-            "input": req.user_input,
-            "timestamp": datetime.now(pytz.UTC)  # Use consistent timezone-aware datetime
-        })
-        return MessageResponse(response="", error=str(e))
+        await errors_col.insert_one({"error": str(e), "input": req.user_input, "timestamp": datetime.now(pytz.UTC)})
+        raise HTTPException(status_code=500, detail=f"Failed to process message: {str(e)}")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
