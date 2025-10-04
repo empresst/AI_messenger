@@ -189,8 +189,6 @@ async def initialize_faiss_store():
             col = conversations_col if item_type == "conversation" else journals_col
             id_field = "conversation_id" if item_type == "conversation" else "entry_id"
             base = await col.find_one({id_field: item_id})
-            if not base and item_type == "journal":
-                base = await col.find_one({id_field: item_id, "user_id": {"$in": [user_id]}})
             if not base:
                 continue
 
@@ -198,7 +196,14 @@ async def initialize_faiss_store():
             if not content:
                 await embeddings_col.delete_one({"item_id": item_id, "item_type": item_type})
                 continue
-
+            owner_ids = emb.get("user_id", [])
+            
+            if item_type == "journal":
+                # Ensure the saved journal actually belongs to the same owner list
+                base_uids = base.get("user_id", [])
+                if isinstance(base_uids, list) and not any(u in base_uids for u in owner_ids):
+                    continue
+                    
             metadata = {
                 "item_id": item_id,
                 "item_type": item_type,
@@ -1111,11 +1116,18 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
         if not item_id or not item_type: continue
         col = conversations_col if item_type=="conversation" else journals_col
         id_field = "conversation_id" if item_type=="conversation" else "entry_id"
-        q = {id_field:item_id, "user_id": user_id}
-        base = await col.find_one(q)
+        base = await col.find_one({id_field: item_id})
         if not base:
-            await embeddings_col.delete_one({"item_id": item_id, "item_type": item_type})
             continue
+        
+        uids = base.get("user_id", [])
+        if isinstance(uids, list):
+            if user_id not in uids:
+                continue
+        else:
+            if uids != user_id:
+                continue
+
         if item_type=="journal":
             base["speaker_name"] = target_name
 
@@ -1128,7 +1140,9 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
         days_old = (datetime.now(pytz.UTC) - ts).days if ts else 9999
         temporal_weight = 1/(1 + np.log1p(max(days_old,1)/30))
         adjusted *= temporal_weight
-        if adjusted < 0.3: continue
+        if adjusted < 0.3:
+            logger.debug(f"skip memory {item_id}: low adjusted={adjusted:.3f} type={item_type}")
+            continue
         mems.append({
             "type": item_type, "content": base["content"], "timestamp": as_utc_aware(base["timestamp"]),
             "score": float(adjusted), "user_id": md.get("user_id", []),
