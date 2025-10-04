@@ -1207,15 +1207,24 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
     if include and mems:
         good = [m for m in mems if all(k in m for k in ["content","type","timestamp","speaker_name"])]
         if good:
-            mems_text = "\n".join([f"- [{m['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}] {m['content']} ({m['type']}, said by {m['speaker_name']})" for m in good])
+            # Present compact, clearly attributed memories; journals show as “(journal, you)”
+            def who(m):
+                return "you" if (m["type"] == "journal") else m["speaker_name"]
+            mems_text = "\n".join([
+                f"- {m['content']} ({m['type']}, {m['timestamp'].strftime('%Y-%m-%d')}, said by {who(m)})"
+                for m in good
+            ])
 
     rails = f"""
     Grounding rules:
     - You may reference dates/timestamps in the earlier conversation history.
     - Do NOT refer to the current message as if it were a past event.
+    - If multiple memories conflict, **prioritize the TARGET user's own journal entries** over conversations or others’ journals.
+    - If a preference is in the TARGET user's journal (e.g., food likes/dislikes), treat it as the source of truth unless the TARGET explicitly overrides it in the *current* message.
     - Only say "you asked this before..." if there is a clearly earlier, highly similar message. Permission: {"ALLOWED" if allow_repeat_ref else "NOT ALLOWED"}.
     - If NOT ALLOWED, avoid implying repetition; respond normally.
     """
+
 
     trait_str = ', '.join([f"{k} ({v['explanation']})" for k,v in list(traits.get('core_traits', {}).items())[:3]]) or "balanced"
     sp_name = (sp or {}).get("display_name") or (sp or {}).get("username") or speaker_id
@@ -1230,11 +1239,15 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
 
     {rails}
 
-    - {'Start with "' + greeting + '" if no earlier messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
-    - Keep it short (2–3 sentences), natural, and personalized.
-    Current user input: {user_input}
+- {'Start with "' + greeting + '" if no earlier messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
+- Keep it short (2–3 sentences), natural, and personalized.
+- If relevant to the current input, **weave in up to 1–2 of these memories naturally**, clearly attributing them (e.g., “I wrote in my journal…”, “you said…”):
+{mems_text}
+- **Prioritize the TARGET’s own journal** for facts about the TARGET; do not contradict it unless the TARGET explicitly changes that fact in the current message.
+Current user input: {user_input}
 
-    Respond directly to the Current user input above.
+Respond directly to the Current user input above.
+
     """
 
     if include:
