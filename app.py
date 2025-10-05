@@ -1277,7 +1277,7 @@ Respond directly to the Current user input above.
 
     if include:
         base_prompt = base_prompt.replace("{rails}\n\n", "{rails}\n\nPotentially relevant memories:\n" + mems_text + "\n\n")
-
+    logger.info(f"Final prompt for AI: {base_prompt}")
     return base_prompt, greeting, use_greeting
 
 async def generate_response(prompt: str, user_input: str, greeting: str, use_greeting: bool) -> str:
