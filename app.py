@@ -1092,6 +1092,13 @@ async def get_greeting_and_tone(bot_role: str, target_id: str) -> Tuple[str,str]
 # ---------------------
 # RAG: memories (convos + journals)
 # ---------------------
+async def check_journals_for_user(user_id: str) -> List[dict]:
+    await get_mongo_client()
+    journals = await journals_col.find({"user_id": user_id}).to_list(length=10)
+    logger.info(f"Found {len(journals)} journals for user: {user_id}")
+    return journals
+
+
 async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str, speaker_name: str, max_memories: int = 5) -> List[dict]:
     global faiss_store
     await ensure_faiss_store()
@@ -1109,12 +1116,16 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
     target_name = (udoc or {}).get("display_name") or (udoc or {}).get("username") or user_id
 
     results = await loop.run_in_executor(None, lambda: faiss_store.similarity_search_with_score(processed, k=max_memories*3))
+    logger.info(f"Retrieved {len(results)} results from FAISS store for query: {user_input}")
+
     mems = []
     for doc, score in results:
         md = doc.metadata
         item_id = md.get("item_id"); item_type = md.get("item_type")
         if not item_id or not item_type: continue
         col = conversations_col if item_type=="conversation" else journals_col
+        logger.info(f"Found memory: item_id={item_id}, type={item_type}, score={score}")
+
         id_field = "conversation_id" if item_type=="conversation" else "entry_id"
         base = await col.find_one({id_field: item_id})
         if not base:
@@ -1493,6 +1504,10 @@ async def process_new_entry(item_id: str, item_type: str, content: str, user_id:
                 meta.update({"speaker_id": speaker_id, "speaker_name": speaker_name, "target_id": target_id, "target_name": target_name})
             faiss_store.add_documents([Document(page_content=content, metadata=meta)])
             faiss_store.save_local(FAISS_DIR)
+            logger.info(f"FAISS store updated with item_id: {item_id} and item_type: {item_type}")
+            faiss_search_results = faiss_store.similarity_search_with_score(content, k=1)  # Just search for the latest added item
+            logger.info(f"FAISS search results for item_id {item_id}: {faiss_search_results}")
+                                
     except Exception as e:
         await errors_col.insert_one({"error": str(e), "item_id": item_id, "item_type": item_type, "timestamp": datetime.now(pytz.UTC)})
 
