@@ -58,6 +58,8 @@ except Exception:
 # ---------------------
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI")
 PUBLIC_UI_API_KEY = os.getenv("PUBLIC_UI_API_KEY", "your-secure-api-key")
 PORT = int(os.getenv("PORT", "8000"))
@@ -68,7 +70,10 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
 if not MONGODB_URI:
     raise RuntimeError("MONGODB_URI missing")
-
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY missing")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY missing")
 # ---------------------
 # Globals (thread-safe)
 # ---------------------
@@ -93,7 +98,11 @@ openai_lock = threading.Lock()
 faiss_lock = threading.Lock()
 
 embedding_cache = TTLCache(maxsize=1000, ttl=3600)
-embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY, model="text-embedding-3-small")
+embeddings = OpenAIEmbeddings(
+    openai_api_key=GEMINI_API_KEY, 
+    openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
+    model="text-embedding-004"
+)
 FAISS_DIR = "faiss_store_v1"
 watcher_task: Optional[asyncio.Task] = None
 
@@ -151,7 +160,10 @@ async def get_openai_client() -> AsyncOpenAI:
     global openai_client
     with openai_lock:
         if openai_client is None:
-            openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+            openai_client = AsyncOpenAI(
+                api_key=GROQ_API_KEY, 
+                base_url="https://api.groq.com/openai/v1"
+            )
     return openai_client
 
 async def ensure_faiss_store():
@@ -1006,7 +1018,7 @@ async def generate_personality_traits(user_id: str) -> dict:
     for attempt in range(3):
         try:
             resp = await (await get_openai_client()).chat.completions.create(
-                model="gpt-4o",
+                model="llama-3.3-70b-versatile",
                 messages=[
                     {"role":"system","content":"You are a helpful assistant that generates personality traits."},
                     {"role":"user","content":big_five_prompt}
@@ -1071,7 +1083,7 @@ async def get_greeting_and_tone(bot_role: str, target_id: str) -> Tuple[str,str]
     for attempt in range(3):
         try:
             resp = await (await get_openai_client()).chat.completions.create(
-                model="gpt-4o",
+                model="llama-3.3-70b-versatile",
                 messages=[
                     {"role":"system","content":"Return only valid JSON with 'greeting' and 'tone' keys."},
                     {"role":"user","content":prompt}
@@ -1283,7 +1295,7 @@ Respond directly to the Current user input above.
 async def generate_response(prompt: str, user_input: str, greeting: str, use_greeting: bool) -> str:
     try:
         resp = await (await get_openai_client()).chat.completions.create(
-            model="gpt-4o",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role":"system","content":"You are an AI Twin responding in a personalized, casual manner."},
                 {"role":"user","content":prompt}
