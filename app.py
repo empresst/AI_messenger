@@ -27,6 +27,8 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
 from openai import AsyncOpenAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
 
 # ---------------------
 # Setup logging
@@ -98,11 +100,12 @@ openai_lock = threading.Lock()
 faiss_lock = threading.Lock()
 
 embedding_cache = TTLCache(maxsize=1000, ttl=3600)
-embeddings = OpenAIEmbeddings(
-    openai_api_key=GEMINI_API_KEY, 
-    openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
-    model="text-embedding-004"
+
+embeddings = GoogleGenerativeAIEmbeddings(
+    model="models/gemini-embedding-001",
+    google_api_key=os.getenv("GEMINI_API_KEY")
 )
+
 FAISS_DIR = "faiss_store_v1"
 watcher_task: Optional[asyncio.Task] = None
 
