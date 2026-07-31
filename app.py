@@ -1290,6 +1290,13 @@ async def get_recent_conversation_history(speaker_id: str, target_id: str, limit
         })
     return out
 
+def _as_uid_list(raw) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw if x is not None]
+    return [str(raw)]
+
 async def generate_personality_traits(user_id: str) -> dict:
     await get_mongo_client()
     # Personality is expensive (LLM). Honor TTL so new journals slowly reshape style.
@@ -1299,14 +1306,20 @@ async def generate_personality_traits(user_id: str) -> dict:
         if updated and (datetime.now(pytz.UTC) - updated) < timedelta(hours=PERSONALITY_CACHE_TTL_H):
             return cached["traits"]
 
-    # user_id is stored as a list on conversations/journals
+    # Only the twin's OWN words + private journals (never partners' messages)
     convs = [doc async for doc in conversations_col.find(
-        {"user_id": {"$in": [user_id]}}
+        {"speaker_id": user_id}
     ).sort("timestamp", -1).limit(80)]
     journals = [doc async for doc in journals_col.find(
         {"user_id": {"$in": [user_id]}}
     ).sort("timestamp", -1).limit(40)]
-    data_text = "\n".join([c.get("content", "") for c in convs] + [j.get("content", "") for j in journals])[:1500]
+    # Extra safety: journals must not be shared ownership
+    own_journal_texts = []
+    for j in journals:
+        j_uids = _as_uid_list(j.get("user_id"))
+        if set(j_uids) == {user_id} or j_uids == [user_id]:
+            own_journal_texts.append(j.get("content", ""))
+    data_text = "\n".join([c.get("content", "") for c in convs] + own_journal_texts)[:1500]
     if not data_text:
         return {"core_traits": {}, "sub_traits": []}
 
@@ -1421,6 +1434,14 @@ async def check_journals_for_user(user_id: str) -> List[dict]:
 
 
 async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str, speaker_name: str, max_memories: int = 5) -> List[dict]:
+    """
+    Retrieve memories for the AI Twin owner (`user_id` = target).
+
+    Privacy rules (strict):
+    - Journals: ONLY the twin's private notes (owner list must be exactly [user_id]).
+    - Conversations: thread must include the twin; first-person facts only from twin's own messages.
+    - Another person's journal must never appear.
+    """
     global faiss_store
     await ensure_faiss_store()
     await get_mongo_client()
@@ -1436,70 +1457,97 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
     udoc = await users_col.find_one({"user_id": user_id})
     target_name = (udoc or {}).get("display_name") or (udoc or {}).get("username") or user_id
 
-    results = await loop.run_in_executor(None, lambda: faiss_store.similarity_search_with_score(processed, k=max_memories*3))
-    logger.info(f"Retrieved {len(results)} results from FAISS store for query: {user_input}")
+    # Fetch extra candidates so ownership filtering still leaves enough hits
+    results = await loop.run_in_executor(
+        None, lambda: faiss_store.similarity_search_with_score(processed, k=max(max_memories * 8, 24))
+    )
+    logger.info(f"Retrieved {len(results)} FAISS candidates for query: {user_input}")
 
     mems = []
     for doc, score in results:
-        md = doc.metadata
-        item_id = md.get("item_id"); item_type = md.get("item_type")
-        if not item_id or not item_type: continue
-        col = conversations_col if item_type=="conversation" else journals_col
-        logger.info(f"Found memory: item_id={item_id}, type={item_type}, score={score}")
+        md = doc.metadata or {}
+        item_id = md.get("item_id")
+        item_type = md.get("item_type")
+        if not item_id or not item_type:
+            continue
 
-        id_field = "conversation_id" if item_type=="conversation" else "entry_id"
+        # Fast reject from FAISS metadata before DB lookup
+        md_uids = _as_uid_list(md.get("user_id"))
+        if md_uids and user_id not in md_uids:
+            continue
+        if item_type == "journal" and md_uids and set(md_uids) != {user_id}:
+            continue
+
+        col = conversations_col if item_type == "conversation" else journals_col
+        id_field = "conversation_id" if item_type == "conversation" else "entry_id"
         base = await col.find_one({id_field: item_id})
         if not base:
             continue
-        
-        uids = base.get("user_id", [])
-        if not isinstance(uids, list):
-            uids = [uids] if uids else []
 
-        # Privacy: only memories that belong to the AI Twin owner (user_id = target)
+        uids = _as_uid_list(base.get("user_id"))
         if user_id not in uids:
             continue
 
+        sp_id = base.get("speaker_id") or md.get("speaker_id")
+        sp_name = base.get("speaker_name") or md.get("speaker_name") or target_name
+        is_own_speech = (item_type == "conversation" and sp_id == user_id)
+        is_own_journal = False
+
         if item_type == "journal":
-            # Journals are private to the twin — reject if shared with anyone else
-            if set(uids) - {user_id}:
+            # Strict private journal ownership — never another user's diary
+            if set(uids) != {user_id}:
+                logger.info(f"skip foreign journal {item_id}: owners={uids} twin={user_id}")
                 continue
-            base["speaker_name"] = target_name
+            is_own_journal = True
+            sp_name = target_name
+            sp_id = user_id
         else:
-            # Conversations: prefer those involving the current speaker (pair context)
-            # Still allow other twin-owned convos at lower score
-            pass
+            # Conversations must involve the twin; drop pure third-party threads
+            if user_id not in uids:
+                continue
 
         adjusted = 1.0 - float(score)
-        if item_type == "journal":
-            adjusted += 0.9
+        if is_own_journal:
+            adjusted += 1.0  # strongest: twin's own private notes
+        elif is_own_speech:
+            adjusted += 0.75  # twin's own spoken words (safe as "I...")
         else:
+            # Someone else speaking in a thread the twin is in — OK for context,
+            # but weaker, and prompt must NOT treat as twin's preference
             pair_hit = (
-                (md.get("speaker_id") == speaker_id and md.get("target_id") == user_id)
-                or (md.get("speaker_id") == user_id and md.get("target_id") == speaker_id)
-                or (base.get("speaker_id") == speaker_id)
+                (sp_id == speaker_id and (base.get("target_id") == user_id or md.get("target_id") == user_id))
+                or (sp_id == user_id)
             )
-            if pair_hit:
-                adjusted += 0.7
-            elif speaker_id in uids:
-                adjusted += 0.35
+            if pair_hit or speaker_id in uids:
+                adjusted += 0.25
             else:
-                adjusted += 0.1  # twin's other chats — weak signal only
-        if speaker_name.lower() in base.get("content", "").lower() or target_name.lower() in base.get("content", "").lower():
-            adjusted += 0.3
+                adjusted += 0.05
+
+        if speaker_name.lower() in (base.get("content") or "").lower() or target_name.lower() in (base.get("content") or "").lower():
+            adjusted += 0.15
+
         ts = as_utc_aware(md.get("timestamp")) or as_utc_aware(base.get("timestamp"))
         days_old = (datetime.now(pytz.UTC) - ts).days if ts else 9999
-        temporal_weight = 1/(1 + np.log1p(max(days_old,1)/30))
+        temporal_weight = 1 / (1 + np.log1p(max(days_old, 1) / 30))
         adjusted *= temporal_weight
+
         if adjusted < 0.3:
-            logger.debug(f"skip memory {item_id}: low adjusted={adjusted:.3f} type={item_type}")
             continue
+
         mems.append({
-            "type": item_type, "content": base["content"], "timestamp": as_utc_aware(base["timestamp"]),
-            "score": float(adjusted), "user_id": md.get("user_id", []),
-            "speaker_id": md.get("speaker_id"), "speaker_name": base.get("speaker_name", target_name),
-            "target_id": md.get("target_id"), "target_name": md.get("target_name")
+            "type": item_type,
+            "content": base.get("content", ""),
+            "timestamp": as_utc_aware(base.get("timestamp")),
+            "score": float(adjusted),
+            "user_id": uids,
+            "speaker_id": sp_id,
+            "speaker_name": sp_name,
+            "target_id": base.get("target_id") or md.get("target_id"),
+            "target_name": base.get("target_name") or md.get("target_name"),
+            "is_own_journal": is_own_journal,
+            "is_own_speech": is_own_speech,
         })
+
     mems.sort(key=lambda x: x["score"], reverse=True)
     return mems[:max_memories]
 
@@ -1578,53 +1626,62 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
     include, mems = await should_include_memories(user_input, speaker_id, target_id)
     mems_text = "No relevant memories."
     if include and mems:
-        good = [m for m in mems if all(k in m for k in ["content","type","timestamp","speaker_name"])]
+        good = [m for m in mems if m.get("content") and m.get("timestamp")]
         if good:
-            # Present compact, clearly attributed memories; journals show as “(journal, you)”
-            def who(m):
-                return "you" if (m["type"] == "journal") else m["speaker_name"]
-            mems_text = "\n".join([
-                f"- {m['content']} ({m['type']}, {m['timestamp'].strftime('%Y-%m-%d')}, said by {who(m)})"
-                for m in good
-            ])
-
-    rails = f"""
-    Grounding rules:
-    - You may reference dates/timestamps in the earlier conversation history.
-    - Do NOT refer to the current message as if it were a past event.
-    - If multiple memories conflict, **prioritize the TARGET user's own journal entries** over conversations or others’ journals.
-    - If a preference is in the TARGET user's journal (e.g., food likes/dislikes), treat it as the source of truth unless the TARGET explicitly overrides it in the *current* message.
-    - Only say "you asked this before..." if there is a clearly earlier, highly similar message. Permission: {"ALLOWED" if allow_repeat_ref else "NOT ALLOWED"}.
-    - If NOT ALLOWED, avoid implying repetition; respond normally.
-    """
-
+            lines = []
+            for m in good:
+                ts = m["timestamp"].strftime("%Y-%m-%d") if m.get("timestamp") else "?"
+                if m.get("is_own_journal"):
+                    lines.append(f'- [YOUR JOURNAL] "{m["content"]}" ({ts}) — this is YOUR private note; you may say "I…".')
+                elif m.get("is_own_speech") or m.get("speaker_id") == target_id:
+                    lines.append(f'- [YOU SAID] "{m["content"]}" ({ts}) — your own past message; you may say "I…".')
+                else:
+                    who = m.get("speaker_name") or "someone"
+                    lines.append(
+                        f'- [{who.upper()} SAID] "{m["content"]}" ({ts}) — NOT your words. '
+                        f'Never claim this preference/fact as yours. Attribute to {who} if you mention it.'
+                    )
+            mems_text = "\n".join(lines)
 
     trait_str = ', '.join([f"{k} ({v['explanation']})" for k,v in list(traits.get('core_traits', {}).items())[:3]]) or "balanced"
     sp_name = (sp or {}).get("display_name") or (sp or {}).get("username") or speaker_id
     tg_name = (tg or {}).get("display_name") or (tg or {}).get("username") or target_id
 
+    rails = f"""
+    Grounding rules (privacy — critical):
+    - You are ONLY {tg_name}'s twin. Never adopt another person's journal or preferences as your own.
+    - First-person facts ("I like…", "I hate…", "I went…") may ONLY come from:
+        (1) [YOUR JOURNAL] entries, or
+        (2) [YOU SAID] messages, or
+        (3) the current user input if it is about you.
+    - Lines marked [NAME SAID] are someone else. If you reference them, say "you said" / "they said", never "I".
+    - If your journal conflicts with someone else's message, YOUR journal wins.
+    - You may reference dates/timestamps in the earlier conversation history.
+    - Do NOT refer to the current message as if it were a past event.
+    - Only say "you asked this before..." if permission is ALLOWED. Permission: {"ALLOWED" if allow_repeat_ref else "NOT ALLOWED"}.
+    """
+
     base_prompt = f"""
     You are {tg_name}, responding as an AI Twin to {sp_name}, their {role_in}.
     Use a {tone} tone and reflect your personality: {trait_str}.
 
-    Earlier conversation (timestamps included, excludes the current message):
+    Earlier conversation with {sp_name} (timestamps included, excludes the current message):
     {hist_text}
 
     {rails}
 
+    Memory snippets (use at most 1–2 if relevant; respect ownership tags):
+    {mems_text}
+
 - {'Start with "' + greeting + '" if no earlier messages or time gap > 30 minutes.' if use_greeting else 'Do not start with a greeting.'}
 - Keep it short (2–3 sentences), natural, and personalized.
-- If relevant to the current input, **weave in up to 1–2 of these memories naturally**, clearly attributing them (e.g., “I wrote in my journal…”, “you said…”):
-{mems_text}
-- **Prioritize the TARGET’s own journal** for facts about the TARGET; do not contradict it unless the TARGET explicitly changes that fact in the current message.
+- Never invent preferences from another person's journal or speech.
+
 Current user input: {user_input}
 
 Respond directly to the Current user input above.
-
     """
 
-    if include:
-        base_prompt = base_prompt.replace("{rails}\n\n", "{rails}\n\nPotentially relevant memories:\n" + mems_text + "\n\n")
     logger.info(f"Final prompt for AI: {base_prompt}")
     return base_prompt, greeting, use_greeting
 
