@@ -1622,24 +1622,106 @@ def _is_lightweight_input(user_input: str) -> bool:
         return True
     return False
 
+async def semantic_own_journals(
+    user_id: str,
+    user_input: str,
+    max_n: int = 3,
+    min_sim: float = 0.28,
+) -> List[dict]:
+    """
+    Semantic search over the twin's private journals via stored embeddings.
+    Cosine similarity only — no keyword / intent lists.
+    """
+    await get_mongo_client()
+    loop = asyncio.get_event_loop()
+    processed = await loop.run_in_executor(None, preprocess_input, user_input)
+    try:
+        q_emb = await loop.run_in_executor(None, lambda: embeddings.embed_query(processed))
+    except Exception as e:
+        logger.warning(f"journal query embed failed: {e}")
+        return []
+
+    q = np.asarray(q_emb, dtype=float)
+    qn = np.linalg.norm(q)
+    if qn < 1e-9:
+        return []
+    q = q / qn
+
+    hits: List[dict] = []
+    cursor = embeddings_col.find({"item_type": "journal"}).sort("timestamp", -1).limit(100)
+    async for doc in cursor:
+        uids = _as_uid_list(doc.get("user_id"))
+        if set(uids) != {user_id}:
+            continue
+        emb = doc.get("embedding")
+        if not emb:
+            continue
+        v = np.asarray(emb, dtype=float)
+        vn = np.linalg.norm(v)
+        if vn < 1e-9:
+            continue
+        sim = float(np.dot(q, v / vn))
+        if sim < min_sim:
+            continue
+        content = (doc.get("content") or "").strip()
+        if not content:
+            base = await journals_col.find_one({"entry_id": doc.get("item_id")})
+            content = ((base or {}).get("content") or "").strip()
+        if not content:
+            continue
+        hits.append({
+            "type": "journal",
+            "content": content,
+            "timestamp": as_utc_aware(doc.get("timestamp")),
+            "score": sim + 0.45,  # own journals compete fairly with chat FAISS scores
+            "user_id": uids,
+            "speaker_id": user_id,
+            "speaker_name": None,
+            "is_own_journal": True,
+            "is_own_speech": False,
+            "sim": sim,
+        })
+
+    hits.sort(key=lambda x: -float(x["score"]))
+    return hits[:max_n]
+
 async def should_include_memories(user_input: str, speaker_id: str, user_id: str) -> Tuple[bool, List[dict]]:
     """
-    Use FAISS-ranked memories already scored in find_relevant_memories.
-    Skip entirely for short pings so the twin doesn't narrate old context unprompted.
+    Semantic retrieval only:
+    - FAISS (ownership-filtered) for chat + journals in the vector index
+    - Extra cosine pass over the twin's journal embeddings (FAISS can under-rank sparse notes)
     """
     if _is_lightweight_input(user_input):
         return False, []
+
     sp = await users_col.find_one({"user_id": speaker_id})
     speaker_name = (sp or {}).get("display_name") or (sp or {}).get("username") or speaker_id
     mems = await find_relevant_memories(speaker_id, user_id, user_input, speaker_name, max_memories=8)
-    if not mems:
-        return False, []
-    rel = []
+
+    rel: List[dict] = []
     for m in mems:
-        thr = 0.45 if m.get("type") == "journal" else 0.55
+        thr = 0.30 if (m.get("is_own_journal") or m.get("type") == "journal") else 0.50
         if float(m.get("score", 0)) >= thr:
             rel.append(m)
-    return (len(rel) > 0), rel[:2]
+
+    try:
+        journal_hits = await semantic_own_journals(user_id, user_input, max_n=3, min_sim=0.28)
+    except Exception as e:
+        logger.warning(f"semantic_own_journals failed: {e}")
+        journal_hits = []
+
+    seen = {(m.get("content") or "").strip().lower() for m in rel}
+    for j in journal_hits:
+        key = (j.get("content") or "").strip().lower()
+        if key and key not in seen:
+            rel.append(j)
+            seen.add(key)
+
+    rel.sort(key=lambda m: (
+        0 if m.get("is_own_journal") else 1,
+        -float(m.get("score") or 0),
+    ))
+    return (len(rel) > 0), rel[:3]
 
 # ---------------------
 # initialize_bot (role auto-detect)
@@ -1748,24 +1830,26 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
     mem_block = "\n".join(mem_lines) if mem_lines else "(none)"
     greet_line = f'Open with "{greeting}" then answer.' if use_greeting else "No greeting — continue the thread."
 
-    # Few-shot style beat long rule lists; hard safety stays in code + short system msg
+    note_hint = ""
+    if any(m.get("is_own_journal") for m in (mems or [])):
+        note_hint = "If a \"your note\" conflicts with agreeing to something, follow the note."
+
     base_prompt = f"""You are {tg_name} texting {sp_name} ({role_in}). Sound like yourself: {tone}.
 {f"Vibe: {trait_str}." if trait_str else ""}
 
 Chat so far:
 {hist_block}
 
-Maybe useful (only if it answers them; otherwise ignore):
+Context from memory (use only if it fits; "your note" is your private truth):
 {mem_block}
+{note_hint}
 
 {greet_line}
 
-Examples of good replies:
+Examples:
+- them: "want to hike again?" → you: "yes! same trail?"
+- them: invite that clashes with your note → you briefly decline or reschedule using the note
 - them: "?" → you: "yeah? what's up"
-- them: "want to hike again?" → you: "yes! same lake trail under the big tree?"
-- them: "coffee?" → you: "only if it's sweet — bitter stuff is gross"
-
-Bad: recapping old messages, listing dates, or explaining your reasoning.
 
 {sp_name}: {user_input}
 {tg_name}:"""
@@ -2256,3 +2340,4 @@ async def initialize_db():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT, proxy_headers=True, timeout_keep_alive=70)
+
