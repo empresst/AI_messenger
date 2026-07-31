@@ -1311,6 +1311,30 @@ def _safe_memory_text(text: str, max_len: int = 280) -> str:
         t = t[: max_len - 1] + "…"
     return t
 
+def _normalize_traits(traits: Any) -> dict:
+    """Ensure traits.core_traits is always a dict; LLM sometimes returns a list."""
+    if not isinstance(traits, dict):
+        return {"core_traits": {}, "sub_traits": []}
+    core = traits.get("core_traits")
+    if isinstance(core, list):
+        normalized = {}
+        for t in core:
+            if not isinstance(t, dict):
+                continue
+            name = t.get("trait") or t.get("name") or t.get("label")
+            if not name:
+                continue
+            normalized[str(name)] = {
+                "score": t.get("score", 50),
+                "explanation": t.get("explanation") or t.get("description") or str(name),
+            }
+        traits["core_traits"] = normalized
+    elif not isinstance(core, dict):
+        traits["core_traits"] = {}
+    if not isinstance(traits.get("sub_traits"), list):
+        traits["sub_traits"] = []
+    return traits
+
 async def generate_personality_traits(user_id: str) -> dict:
     await get_mongo_client()
     # Personality is expensive (LLM). Honor TTL so new journals slowly reshape style.
@@ -1318,7 +1342,7 @@ async def generate_personality_traits(user_id: str) -> dict:
     if cached and "traits" in cached:
         updated = as_utc_aware(cached.get("updated_at") or cached.get("timestamp"))
         if updated and (datetime.now(pytz.UTC) - updated) < timedelta(hours=PERSONALITY_CACHE_TTL_H):
-            return cached["traits"]
+            return _normalize_traits(cached["traits"])
 
     # Only the twin's OWN words + private journals (never partners' messages)
     convs = [doc async for doc in conversations_col.find(
@@ -1359,10 +1383,8 @@ async def generate_personality_traits(user_id: str) -> dict:
             )
             txt = resp.choices[0].message.content.strip()
             txt = re.sub(r'^```json\s*|\s*```$', '', txt, flags=re.MULTILINE).strip()
-            traits = json.loads(txt)
+            traits = _normalize_traits(json.loads(txt))
             if "core_traits" in traits and "sub_traits" in traits:
-                if isinstance(traits["core_traits"], list):
-                    traits["core_traits"] = {t["trait"]: {"score": t["score"], "explanation": t["explanation"]} for t in traits["core_traits"]}
                 break
         except Exception:
             if attempt == 2:
@@ -1380,6 +1402,7 @@ async def generate_personality_traits(user_id: str) -> dict:
                         {"trait":"curious","description":"Engages with data."}
                     ]
                 }
+    traits = _normalize_traits(traits or {"core_traits": {}, "sub_traits": []})
     await personalities_col.update_one(
         {"user_id": user_id},
         {"$set": {"traits": traits, "updated_at": datetime.now(pytz.UTC)}},
@@ -1412,8 +1435,17 @@ async def get_greeting_and_tone(bot_role: str, target_id: str) -> Tuple[str,str]
     greeting, tone = defaults.get(bot_role.lower(), ("Hey","casual, friendly"))
 
     traits = await generate_personality_traits(target_id)
+    core = traits.get("core_traits") if isinstance(traits, dict) else {}
+    if isinstance(core, dict):
+        trait_names = ", ".join(list(core.keys())[:5])
+    elif isinstance(core, list):
+        trait_names = ", ".join(
+            str((t.get("trait") if isinstance(t, dict) else t) or "") for t in core[:5]
+        )
+    else:
+        trait_names = ""
     prompt = f"""
-    You are generating a greeting for a {bot_role} with traits: {', '.join(traits.get('core_traits', {}).keys())}.
+    You are generating a greeting for a {bot_role} with traits: {trait_names or "balanced"}.
     Return a JSON object: {{"greeting":"short greeting","tone":"tone description"}}
     """
     for attempt in range(3):
@@ -1577,9 +1609,13 @@ def _is_lightweight_input(user_input: str) -> bool:
         "?", "??", "???", "...", "ok", "okay", "k", "kk", "yes", "y", "no", "n",
         "hi", "hey", "hello", "yo", "sup", "hmm", "hmmm", "lol", "haha", "hehe",
         "thanks", "ty", "np", "cool", "nice", "sure", "yup", "yeah", "nah",
-        "what", "huh", "right", "true", "same", "idk", "oh", "ah", "mhm", "hm",
+        "what", "what?", "what's up", "whats up", "wut", "huh", "right", "true",
+        "same", "idk", "oh", "ah", "mhm", "hm", "and?", "so?", "well?",
     }
     if t in lightweight:
+        return True
+    # "what???" / "hey!" style
+    if re.fullmatch(r"(what|hey|hi|ok|okay|yeah|yup|nah|huh|oh)\?{0,3}!{0,3}", t):
         return True
     # single emoji / punctuation-only
     if re.fullmatch(r"[\W_]+", t):
@@ -1684,13 +1720,25 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
                 who = m.get("speaker_name") or "they"
                 mem_lines.append(f"- {who} said: {body}")
 
-    # Light personality hint (avoid dumping Big-Five essays into every reply)
+    # Light personality hint — core_traits may be dict OR list (LLM/cache variance)
     trait_bits = []
-    for k, v in list((traits or {}).get("core_traits") or {}).items()[:2]:
-        if isinstance(v, dict) and v.get("explanation"):
-            trait_bits.append(str(v["explanation"]).split(".")[0])
-        elif isinstance(v, str):
-            trait_bits.append(v)
+    core = (traits or {}).get("core_traits") if isinstance(traits, dict) else None
+    if isinstance(core, dict):
+        for k, v in list(core.items())[:2]:
+            if isinstance(v, dict) and v.get("explanation"):
+                trait_bits.append(str(v["explanation"]).split(".")[0])
+            elif isinstance(v, str):
+                trait_bits.append(v)
+            else:
+                trait_bits.append(str(k))
+    elif isinstance(core, list):
+        for item in core[:2]:
+            if isinstance(item, dict):
+                exp = item.get("explanation") or item.get("description") or item.get("trait")
+                if exp:
+                    trait_bits.append(str(exp).split(".")[0])
+            elif isinstance(item, str):
+                trait_bits.append(item)
     trait_str = "; ".join(trait_bits) if trait_bits else ""
 
     sp_name = (sp or {}).get("display_name") or (sp or {}).get("username") or speaker_id
@@ -2208,4 +2256,3 @@ async def initialize_db():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT, proxy_headers=True, timeout_keep_alive=70)
-
