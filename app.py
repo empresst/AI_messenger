@@ -104,6 +104,24 @@ faiss_lock = threading.Lock()
 
 embedding_cache = TTLCache(maxsize=2000, ttl=3600)
 
+# Simple in-memory rate limits (per process; fine for single Render instance)
+_rate_buckets: Dict[str, list] = {}
+_rate_lock = threading.Lock()
+RATE_SEND_PER_MIN = int(os.getenv("RATE_SEND_PER_MIN", "30"))
+RATE_JOURNAL_PER_MIN = int(os.getenv("RATE_JOURNAL_PER_MIN", "10"))
+
+def _rate_allow(key: str, limit: int, window_s: int = 60) -> bool:
+    now = datetime.now(pytz.UTC).timestamp()
+    with _rate_lock:
+        bucket = _rate_buckets.get(key, [])
+        bucket = [t for t in bucket if now - t < window_s]
+        if len(bucket) >= limit:
+            _rate_buckets[key] = bucket
+            return False
+        bucket.append(now)
+        _rate_buckets[key] = bucket
+        return True
+
 embeddings = GoogleGenerativeAIEmbeddings(
     model="models/gemini-embedding-001",
     google_api_key=GEMINI_API_KEY
@@ -411,6 +429,7 @@ class SignupRequest(BaseModel):
     username: str
     display_name: str
     password: str
+    gender: Optional[str] = None  # "female" | "male" | "other" | null — optional, backward compatible
 
 class LoginRequest(BaseModel):
     username: str
@@ -423,6 +442,9 @@ class RelationshipSetRequest(BaseModel):
 class JournalAddRequest(BaseModel):
     content: str
     consent: bool
+
+class GenderUpdateRequest(BaseModel):
+    gender: Optional[str] = None  # "female" | "male" | "other" | null
 
 # ---------------------
 # HTML UI (same as your enhanced version, with tiny fix: do not force bot_role)
@@ -437,49 +459,63 @@ async def home():
 <title>AI Twin Chat</title>
 <style>
 * { box-sizing: border-box }
-:root { --bg:#0f172a; --fg:#fff; --muted:#64748b; --border:#e2e8f0; --card:#f8fafc; }
-body { margin:0; font-family: Inter, system-ui, Arial }
-header { padding: 10px 16px; background:var(--bg); color:var(--fg); display:flex; justify-content:space-between; align-items:center }
-main { display:flex; height: calc(100vh - 56px) }
-#sidebar { width:360px; border-right:1px solid var(--border); padding:12px; overflow:auto }
-#content { flex:1; display:flex; flex-direction:column }
-section { margin-bottom:16px }
-h3 { margin:8px 0 }
-input, select, button, textarea { padding:10px; margin:6px 0; width:100%; font-size:14px }
-textarea { resize:none; min-height:48px; max-height:160px; line-height:20px; }
-button { cursor:pointer }
-.user-item { padding:8px; border:1px solid var(--border); border-radius:8px; margin:6px 0; display:flex; gap:8px; align-items:center; justify-content:space-between; background:#fff }
-.badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; background:#e2e8f0 }
-.badge.online { background:#bbf7d0 }
-.pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; background:#fde68a; color:#92400e; margin-left:6px }
-.chatgrid { flex:1; display:grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap:12px; padding:12px; overflow:auto }
-.chatbox { border:1px solid var(--border); border-radius:10px; display:flex; flex-direction:column; min-height:360px; background:#fff }
-.chatbox header { background:var(--card); color:#0f172a; font-weight:600; padding:8px 10px; display:flex; align-items:center; justify-content:space-between }
+:root {
+  --bg:#0b141a; --panel:#111b21; --panel2:#202c33; --fg:#e9edef; --muted:#8696a0;
+  --border:#2a3942; --accent:#00a884; --accent2:#005c4b; --you:#005c4b; --them:#202c33;
+  --ai:#3b2f0b; --danger:#ea4335; --card:#111b21;
+}
+body { margin:0; font-family: Segoe UI, Helvetica, system-ui, Arial; background:#0b141a; color:var(--fg); }
+header.appbar { padding:10px 16px; background:var(--panel2); color:var(--fg); display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border) }
+main { display:flex; height: calc(100vh - 52px); overflow:hidden }
+#sidebar { width:380px; max-width:100%; border-right:1px solid var(--border); background:var(--panel); display:flex; flex-direction:column; overflow:hidden }
+#sidebarScroll { flex:1; overflow:auto; padding:10px }
+#content { flex:1; display:flex; flex-direction:column; background:#0b141a; min-width:0 }
+section { margin-bottom:14px }
+h3 { margin:8px 0; font-size:15px; color:var(--fg) }
+input, select, button, textarea { padding:10px; margin:6px 0; width:100%; font-size:14px; border-radius:8px; border:1px solid var(--border); background:var(--panel2); color:var(--fg) }
+textarea { resize:none; min-height:48px; max-height:140px; line-height:20px; }
+button { cursor:pointer; background:var(--accent); color:#fff; border:none; font-weight:600 }
+button.secondary { background:var(--panel2); color:var(--fg); border:1px solid var(--border) }
+button.danger { background:var(--danger) }
+.user-item { padding:10px 12px; border-radius:10px; margin:4px 0; display:flex; gap:10px; align-items:center; justify-content:space-between; background:transparent; cursor:pointer; border:1px solid transparent }
+.user-item:hover, .user-item.active { background:var(--panel2); border-color:var(--border) }
+.badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; background:#2a3942; color:var(--muted) }
+.badge.online { background:#0b6b4f; color:#d1fae5 }
+.pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; background:#3b2f0b; color:#fde68a; margin-left:6px }
+#chatEmpty { flex:1; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:15px }
+#chatActive { flex:1; display:none; flex-direction:column; min-height:0 }
+.chat-header { background:var(--panel2); padding:12px 16px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border) }
 .header-right { display:flex; align-items:center; gap:6px }
-.messages { flex:1; padding:10px; overflow:auto; font-size:14px; background:#fafafa }
-.msg { margin:8px 0; padding:8px 10px; border-radius:8px; max-width:92%; box-shadow:0 1px 0 rgba(0,0,0,.04) }
-.msg.you { background:#dbeafe; align-self:flex-end }
-.msg.them { background:#dcfce7 }
-.msg.ai { background:#fef3c7 }
-.meta { font-size:11px; color:var(--muted); margin-top:4px }
-.typing { font-size:12px; color:var(--muted); margin:6px 0 0 2px }
-.actions { padding:8px; display:flex; gap:8px; border-top:1px solid var(--border); background:#fff }
-.actions textarea { flex:1; border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
-.actions button { width:auto; padding:10px 14px; border-radius:8px; background:#0ea5e9; color:#fff; border:none }
-.actions button:disabled { opacity:.6; cursor:not-allowed }
+#messages { flex:1; padding:16px; overflow:auto; display:flex; flex-direction:column; gap:2px; background:#0b141a }
+.msg { margin:4px 0; padding:8px 12px; border-radius:8px; max-width:min(72%, 520px); line-height:1.4; word-wrap:break-word }
+.msg.you { background:var(--you); align-self:flex-end; border-top-right-radius:2px }
+.msg.them { background:var(--them); align-self:flex-start; border-top-left-radius:2px }
+.msg.ai { background:var(--ai); align-self:flex-start; border-top-left-radius:2px; border:1px solid #5c4b1a }
+.msg.system { background:transparent; align-self:center; color:var(--muted); font-size:12px; box-shadow:none }
+.meta { font-size:10px; color:var(--muted); margin-top:4px; text-align:right }
+.typing { font-size:12px; color:var(--muted); padding:0 16px 6px; display:none }
+.actions { padding:10px 12px; display:flex; gap:8px; border-top:1px solid var(--border); background:var(--panel); align-items:flex-end }
+.actions textarea { flex:1; margin:0; border:none; background:var(--panel2) }
+.actions button { width:auto; padding:12px 18px; margin:0 }
+.actions button:disabled { opacity:.55; cursor:not-allowed }
 .small { font-size:12px; color:var(--muted) }
-.form-card { border:1px solid var(--border); border-radius:10px; padding:12px; background:#fff }
+.form-card { border:1px solid var(--border); border-radius:10px; padding:12px; background:var(--panel2) }
 .row { display:flex; gap:8px }
 .row > * { flex:1 }
 hr { border:0; border-top:1px solid var(--border); margin:12px 0 }
-.list { border:1px solid var(--border); border-radius:10px; padding:8px; background:#fff; max-height:220px; overflow:auto }
-.item { padding:6px 6px; border-bottom:1px dashed #e5e7eb }
+.list { border:1px solid var(--border); border-radius:10px; padding:8px; background:var(--panel2); max-height:180px; overflow:auto }
+.item { padding:6px; border-bottom:1px dashed var(--border) }
 .item:last-child { border-bottom:none }
-.warn { color:#92400e; background:#fef3c7; padding:6px 8px; border-radius:8px; font-size:12px; }
+.warn { color:#fde68a; background:#3b2f0b; padding:6px 8px; border-radius:8px; font-size:12px; }
+@media (max-width: 800px) {
+  #sidebar { width:100%; }
+  main.chat-open #sidebar { display:none }
+  main.chat-open #content { display:flex }
+}
 </style>
 </head>
 <body>
-<header>
+<header class="appbar">
   <div>AI Twin Chat</div>
   <div id="whoami" class="small"></div>
 </header>
@@ -498,6 +534,12 @@ hr { border:0; border-top:1px solid var(--border); margin:12px 0 }
         <input id="signupUsername" placeholder="username"/>
         <input id="signupDisplayName" placeholder="display name"/>
         <input id="signupPassword" placeholder="password" type="password"/>
+        <select id="signupGender">
+          <option value="">gender (optional)</option>
+          <option value="female">female</option>
+          <option value="male">male</option>
+          <option value="other">other</option>
+        </select>
         <button id="signupBtn">Create account</button>
       </div>
       <div style="margin-top:10px">
@@ -506,22 +548,32 @@ hr { border:0; border-top:1px solid var(--border); margin:12px 0 }
       </div>
     </section>
 
+    <div id="sidebarScroll">
     <section id="me" style="display:none">
       <div class="form-card">
         <h3>Me</h3>
         <div id="meInfo"></div>
+        <div class="row" style="margin-top:6px">
+          <select id="genderSelect">
+            <option value="">gender (optional)</option>
+            <option value="female">female</option>
+            <option value="male">male</option>
+            <option value="other">other</option>
+          </select>
+          <button id="genderSaveBtn" class="secondary">Save</button>
+        </div>
         <div class="row">
           <label class="small" style="display:flex; align-items:center; gap:8px">
             <input type="checkbox" id="aiToggle"/>
             AI respond for me
           </label>
-          <button id="logoutBtn" style="background:#ef4444">Logout</button>
+          <button id="logoutBtn" class="danger">Logout</button>
         </div>
       </div>
     </section>
 
     <section id="users" style="display:none">
-      <h3>Users</h3>
+      <h3>Chats</h3>
       <div id="usersList"></div>
     </section>
 
@@ -539,7 +591,6 @@ hr { border:0; border-top:1px solid var(--border); margin:12px 0 }
       <div id="relStatus" class="small"></div>
     </section>
 
-    <!-- JOURNAL SECTION -->
     <section id="journal" style="display:none">
       <h3>Journal</h3>
       <div class="warn">Notes here become your private memory and may be used to personalize replies.</div>
@@ -549,16 +600,36 @@ hr { border:0; border-top:1px solid var(--border); margin:12px 0 }
       </label>
       <div class="row">
         <button id="saveJournalBtn">Save Journal</button>
-        <button id="refreshJournalBtn" style="background:#64748b">Refresh</button>
+        <button id="refreshJournalBtn" class="secondary">Refresh</button>
       </div>
       <div id="journalStatus" class="small"></div>
       <div style="margin-top:8px" class="small">Recent entries</div>
       <div id="journalList" class="list"></div>
     </section>
+    </div>
   </div>
 
   <div id="content">
-    <div class="chatgrid" id="chatGrid"></div>
+    <div id="chatEmpty">Select a chat from the left to start messaging</div>
+    <div id="chatActive">
+      <div class="chat-header">
+        <div>
+          <button id="backBtn" class="secondary" style="width:auto;display:none;margin-right:8px">←</button>
+          <span id="chatTitle">Chat</span>
+          <span id="chatSub" class="small"></span>
+        </div>
+        <div class="header-right">
+          <span class="badge" id="chatOnline">offline</span>
+          <span class="pill" id="chatAiPill" style="display:none">AI replies</span>
+        </div>
+      </div>
+      <div id="messages"></div>
+      <div class="typing" id="typing">AI is typing…</div>
+      <div class="actions">
+        <textarea placeholder="Type a message" id="chatInput"></textarea>
+        <button id="chatSend">Send</button>
+      </div>
+    </div>
   </div>
 </main>
 
@@ -568,7 +639,8 @@ let API_KEY = "";
 let SESSION = "";
 let ME = null;
 let WS = null;
-const chatBoxes = new Map(); // other_user_id -> {box, area, btn, typingEl, aiExpected}
+let ACTIVE = null; // {user_id, display_name, username, online, ai_enabled, relation}
+const peers = new Map(); // user_id -> user object
 
 function el(id){ return document.getElementById(id) }
 
@@ -598,10 +670,11 @@ function renderMe(){
   el('meInfo').innerHTML = `
     <div><b>${ME.display_name}</b> <span class="small">(@${ME.username})</span></div>
     <div class="small">user_id: ${ME.user_id}</div>
-    <div class="small">AI: ${ME.ai_enabled ? 'ON' : 'OFF'}</div>
+    <div class="small">AI: ${ME.ai_enabled ? 'ON' : 'OFF'}${ME.gender ? ' · ' + ME.gender : ''}</div>
   `;
   el('whoami').innerText = `${ME.display_name} (@${ME.username})`;
   el('aiToggle').checked = !!ME.ai_enabled;
+  if(el('genderSelect')) el('genderSelect').value = ME.gender || '';
 }
 
 async function refreshUsers(){
@@ -610,21 +683,21 @@ async function refreshUsers(){
   const relSel = el('relOther');
   container.innerHTML = '';
   relSel.innerHTML = '';
+  peers.clear();
   (data.users || []).filter(u=>u.user_id!==ME.user_id).forEach(u=>{
+     peers.set(u.user_id, u);
      const div = document.createElement('div');
-     div.className='user-item';
-     const badge = `<span class="badge ${u.online?'online':''}">${u.online?'online':'offline'}</span>`;
-     const ai = u.ai_enabled ? `<span class="pill">AI replies</span>` : '';
+     div.className='user-item' + (ACTIVE && ACTIVE.user_id===u.user_id ? ' active' : '');
+     div.dataset.id = u.user_id;
+     const badge = `<span class="badge ${u.online?'online':''}" id="on_${u.user_id}">${u.online?'online':'offline'}</span>`;
+     const ai = u.ai_enabled ? `<span class="pill">AI</span>` : '';
      div.innerHTML = `
        <div>
-         <div><b>${u.display_name}</b> <span class="small">(@${u.username})</span> ${ai}</div>
-         <div class="small">rel: ${u.relation || '-'}</div>
+         <div><b>${u.display_name}</b> <span class="small">@${u.username}</span> ${ai}</div>
+         <div class="small">${u.relation || 'no relation set'}</div>
        </div>
-       <div>
-         ${badge}
-         <button data-id="${u.user_id}">Chat</button>
-       </div>`;
-     div.querySelector('button').onclick=()=>openChat(u);
+       <div>${badge}</div>`;
+     div.onclick=()=>openChat(u);
      container.appendChild(div);
 
      const opt = document.createElement('option');
@@ -633,84 +706,77 @@ async function refreshUsers(){
   });
 }
 
-function ensureBox(u){
-  if(chatBoxes.has(u.user_id)) return chatBoxes.get(u.user_id);
-  const div = document.createElement('div');
-  div.className='chatbox';
-  div.innerHTML = `
-    <header>
-      <div>${u.display_name} <span class="small">(@${u.username})</span></div>
-      <div class="header-right">
-        <span class="badge ${u.online?'online':''}" id="on_${u.user_id}">${u.online?'online':'offline'}</span>
-        ${u.ai_enabled?'<span class="pill">AI replies</span>':''}
-      </div>
-    </header>
-    <div class="messages" id="msg_${u.user_id}"></div>
-    <div class="typing" id="typing_${u.user_id}" style="display:none">AI is typing…</div>
-    <div class="actions">
-      <textarea placeholder="Write a message…" id="inp_${u.user_id}"></textarea>
-      <button id="send_${u.user_id}">Send</button>
-    </div>
-  `;
-  el('chatGrid').appendChild(div);
-  const area = el('inp_'+u.user_id);
-  const btn = el('send_'+u.user_id);
-  const typingEl = el('typing_'+u.user_id);
-  area.addEventListener('input', ()=>autoresizeTA(area));
-  area.addEventListener('keypress', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendTo(u.user_id); }});
-  btn.onclick=()=>sendTo(u.user_id);
-  chatBoxes.set(u.user_id, {box:div, area, btn, typingEl, aiExpected: !!u.ai_enabled});
-  return chatBoxes.get(u.user_id);
+function showChatPane(show){
+  el('chatEmpty').style.display = show ? 'none' : 'flex';
+  el('chatActive').style.display = show ? 'flex' : 'none';
+  document.querySelector('main').classList.toggle('chat-open', !!show);
+  if(window.matchMedia('(max-width:800px)').matches){
+    el('backBtn').style.display = show ? 'inline-block' : 'none';
+  }
 }
 
 async function openChat(u){
-  const {area} = ensureBox(u);
-  // load last 30 messages
-  const res = await req(`/conversations/with/${u.user_id}?limit=30`);
-  const msgs = res.messages || [];
-  const pane = el('msg_'+u.user_id);
-  pane.innerHTML='';
-  msgs.forEach(m=>appendMsg(u.user_id, m));
-  area.focus();
+  ACTIVE = u;
+  showChatPane(true);
+  el('chatTitle').textContent = u.display_name;
+  el('chatSub').textContent = ' @' + u.username + (u.relation ? ' · ' + u.relation : '');
+  const on = el('chatOnline');
+  on.textContent = u.online ? 'online' : 'offline';
+  on.className = 'badge' + (u.online ? ' online' : '');
+  el('chatAiPill').style.display = u.ai_enabled ? 'inline-block' : 'none';
+  document.querySelectorAll('.user-item').forEach(n=>{
+    n.classList.toggle('active', n.dataset.id === u.user_id);
+  });
+  const pane = el('messages');
+  pane.innerHTML = '';
+  try{
+    const res = await req(`/conversations/with/${u.user_id}?limit=40`);
+    (res.messages || []).forEach(m=>appendMsg(u.user_id, m));
+  }catch(e){
+    appendMsg(u.user_id, {content:'Failed to load history', timestamp:new Date().toISOString(), source:'system'});
+  }
+  el('chatInput').focus();
 }
 
 function appendMsg(other_id, m, localEcho=false){
-  const pane = el('msg_'+other_id);
+  if(!ACTIVE || ACTIVE.user_id !== other_id) return;
+  const pane = el('messages');
   if(!pane) return;
   const wrapper = document.createElement('div');
-  const who = localEcho ? 'you' : (m.speaker_id===ME.user_id ? 'you' : (m.source==='ai_twin' ? 'ai' : 'them'));
+  let who;
+  if(localEcho) who = 'you';
+  else if(m.source==='system') who = 'system';
+  else if(m.speaker_id===ME.user_id) who = 'you';
+  else if(m.source==='ai_twin') who = 'ai';
+  else who = 'them';
   wrapper.className = `msg ${who}`;
   const when = new Date(m.timestamp).toLocaleString();
-  wrapper.innerHTML = `${m.content}<div class="meta">${when}${localEcho?' • ✓ Sent':''}</div>`;
+  const safe = String(m.content||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  wrapper.innerHTML = `${safe}<div class="meta">${when}${localEcho?' · ✓':''}</div>`;
   pane.appendChild(wrapper);
   pane.scrollTop = pane.scrollHeight;
 }
 
 function showTyping(other_id, on){
-  const elT = el('typing_'+other_id);
-  if(!elT) return;
-  elT.style.display = on ? 'block' : 'none';
+  if(!ACTIVE || ACTIVE.user_id !== other_id) return;
+  el('typing').style.display = on ? 'block' : 'none';
 }
 
 async function sendTo(other_id){
-  const ref = chatBoxes.get(other_id);
-  if(!ref) return;
-  const {area, btn, aiExpected} = ref;
+  if(!ACTIVE || ACTIVE.user_id !== other_id) return;
+  const area = el('chatInput');
+  const btn = el('chatSend');
   const text = (area.value || '').trim();
   if(!text) return;
   area.value=''; autoresizeTA(area);
   btn.disabled = true;
 
-  // Local echo immediately
   appendMsg(other_id, {content:text, timestamp: new Date().toISOString(), speaker_id: ME.user_id, source:'human'}, true);
-
-  // If we expect AI, show typing until reply arrives
+  const aiExpected = !!(ACTIVE && ACTIVE.ai_enabled);
   if(aiExpected) showTyping(other_id, true);
 
-  // Prefer WS if connected, else HTTP
   if(WS && WS.readyState===1){
     WS.send(JSON.stringify({type:'chat', to: other_id, text}));
-    // AI reply will arrive as WS "ai" event if enabled
     btn.disabled = false;
   }else{
     try{
@@ -719,12 +785,11 @@ async function sendTo(other_id){
         target_id: other_id,
         user_input: text
       });
-      // If server returned an AI reply (HTTP path), append it
       if(res && res.response && res.response !== 'Sent.'){
         appendMsg(other_id, {content: res.response, timestamp: new Date().toISOString(), speaker_id: other_id, source:'ai_twin'});
       }
     }catch(e){
-      appendMsg(other_id, {content: '⚠️ Failed to send: '+(e.message||e), timestamp: new Date().toISOString(), speaker_id: other_id, source:'system'});
+      appendMsg(other_id, {content: 'Failed to send: '+(e.message||e), timestamp: new Date().toISOString(), source:'system'});
     }finally{
       showTyping(other_id, false);
       btn.disabled = false;
@@ -757,10 +822,18 @@ function connectWS(){
       const msg = JSON.parse(ev.data);
       if(msg.type==='pong'){ return; }
       if(msg.type==='presence'){
-        (msg.online||[]).forEach(uid=>{
+        const online = new Set(msg.online||[]);
+        peers.forEach((u, uid)=>{
+          u.online = online.has(uid);
           const b = document.getElementById('on_'+uid);
-          if(b){ b.classList.add('online'); b.textContent='online'; }
+          if(b){ b.className = 'badge'+(u.online?' online':''); b.textContent=u.online?'online':'offline'; }
         });
+        if(ACTIVE){
+          const on = el('chatOnline');
+          const isOn = online.has(ACTIVE.user_id);
+          on.textContent = isOn ? 'online' : 'offline';
+          on.className = 'badge'+(isOn?' online':'');
+        }
       }else if(msg.type==='chat'){
         appendMsg(msg.from, msg.payload);
       }else if(msg.type==='ai'){
@@ -824,20 +897,32 @@ document.addEventListener('DOMContentLoaded', ()=>{
     const username = el('signupUsername').value.trim();
     const display_name = el('signupDisplayName').value.trim() || username;
     const password = el('signupPassword').value.trim();
+    const gender = (el('signupGender').value || '').trim() || null;
     if(!username || !password){ alert('Username and password required'); return; }
-    await req('/auth/signup','POST',{username,display_name,password});
+    const body = {username, display_name, password};
+    if(gender) body.gender = gender;
+    await req('/auth/signup','POST', body);
     alert('Signed up! Now login using the Login form above.');
   };
 
   // Logout
   el('logoutBtn').onclick = async ()=>{
-    await req('/auth/logout','POST',{}); SESSION=''; ME=null; setAuthVisible(false); location.reload();
+    try{ await req('/auth/logout','POST',{}); }catch(e){}
+    SESSION=''; ME=null; ACTIVE=null; setAuthVisible(false); location.reload();
   };
 
   // AI toggle
   el('aiToggle').onchange = async (e)=>{
     await req(`/users/me/ai-toggle?enabled=${e.target.checked}`,'PATCH');
     ME.ai_enabled = e.target.checked;
+    renderMe();
+  };
+
+  el('genderSaveBtn').onclick = async ()=>{
+    const gender = (el('genderSelect').value || '').trim() || null;
+    await req('/users/me/gender','PATCH', {gender});
+    ME.gender = gender;
+    renderMe();
   };
 
   // Relationship save
@@ -855,7 +940,15 @@ document.addEventListener('DOMContentLoaded', ()=>{
   el('saveJournalBtn').onclick = saveJournal;
   el('refreshJournalBtn').onclick = refreshJournal;
 
+  el('chatSend').onclick = ()=>{ if(ACTIVE) sendTo(ACTIVE.user_id); };
+  el('chatInput').addEventListener('input', ()=>autoresizeTA(el('chatInput')));
+  el('chatInput').addEventListener('keypress', e=>{
+    if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); if(ACTIVE) sendTo(ACTIVE.user_id); }
+  });
+  el('backBtn').onclick = ()=>{ ACTIVE=null; showChatPane(false); };
+
   setAuthVisible(false);
+  showChatPane(false);
 });
 </script>
 </body>
@@ -875,6 +968,25 @@ def require_api_key(x_api_key: _Optional[str] = Header(None)):
         if x_api_key != expected:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
+def _normalize_gender(g: Optional[str]) -> Optional[str]:
+    if g is None:
+        return None
+    g = str(g).strip().lower()
+    if g in ("", "null", "none", "prefer_not"):
+        return None
+    if g in ("female", "male", "other"):
+        return g
+    raise HTTPException(status_code=400, detail="gender must be female, male, other, or null")
+
+def _user_public(u: dict) -> dict:
+    return {
+        "user_id": u["user_id"],
+        "username": u["username"],
+        "display_name": u["display_name"],
+        "ai_enabled": bool(u.get("ai_enabled", False)),
+        "gender": u.get("gender"),
+    }
+
 @app.post("/auth/signup")
 async def signup(req: SignupRequest, _: None = Depends(require_api_key)):
     await get_mongo_client()
@@ -884,6 +996,7 @@ async def signup(req: SignupRequest, _: None = Depends(require_api_key)):
     user_id = f"user_{uuid.uuid4().hex[:8]}"
     h = hash_password(req.password)
     now = datetime.now(pytz.UTC)
+    gender = _normalize_gender(req.gender)
     doc = {
         "user_id": user_id,
         "username": req.username,
@@ -891,6 +1004,7 @@ async def signup(req: SignupRequest, _: None = Depends(require_api_key)):
         "password_salt": h["salt"],
         "password_hash": h["hash"],
         "ai_enabled": False,
+        "gender": gender,
         "created_at": now,
         "last_seen": now
     }
@@ -907,7 +1021,7 @@ async def login(req: LoginRequest, _: None = Depends(require_api_key)):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = await create_session(user["user_id"])
     await users_col.update_one({"user_id": user["user_id"]}, {"$set": {"last_seen": datetime.now(pytz.UTC)}})
-    return {"token": token, "user": {"user_id": user["user_id"], "username": user["username"], "display_name": user["display_name"], "ai_enabled": user.get("ai_enabled", False)}}
+    return {"token": token, "user": _user_public(user)}
 
 @app.post("/auth/logout")
 async def logout(sess=Depends(require_session), _: None = Depends(require_api_key)):
@@ -920,7 +1034,18 @@ async def logout(sess=Depends(require_session), _: None = Depends(require_api_ke
 @app.get("/users/me")
 async def users_me(sess=Depends(require_session), _: None = Depends(require_api_key)):
     u = sess["user"]
-    return {"user": {"user_id": u["user_id"], "username": u["username"], "display_name": u["display_name"], "ai_enabled": u.get("ai_enabled", False)}}
+    # Refresh from DB so gender/ai_enabled stay current
+    fresh = await users_col.find_one({"user_id": u["user_id"]}) or u
+    return {"user": _user_public(fresh)}
+
+@app.patch("/users/me/gender")
+async def update_gender(req: GenderUpdateRequest, sess=Depends(require_session), _: None = Depends(require_api_key)):
+    gender = _normalize_gender(req.gender)
+    await users_col.update_one(
+        {"user_id": sess["user"]["user_id"]},
+        {"$set": {"gender": gender}}
+    )
+    return {"ok": True, "gender": gender}
 
 @app.patch("/users/me/ai-toggle")
 async def toggle_ai(enabled: bool = Query(...), sess=Depends(require_session), _: None = Depends(require_api_key)):
@@ -947,16 +1072,14 @@ async def users_list(sess=Depends(require_session), _: None = Depends(require_ap
     return {"users": users}
 
 # --- Relationship utils ---
-# Symmetric pairs are safe to auto-invert. Parent/child is gender-ambiguous,
-# so we only auto-invert when the mapping is unambiguous; otherwise the other
-# user can set their own view (or we fall back to the inverse of what they set).
+# Symmetric pairs are safe to auto-invert. Parent/child uses optional user.gender
+# when available so mother/father ↔ son/daughter is correct.
 INVERSE_REL = {
     "wife": "husband",
     "husband": "wife",
     "friend": "friend",
     "sister": "brother",
     "brother": "sister",
-    # Best-effort parent/child (prefer not to invent gender)
     "mother": "child",
     "father": "child",
     "son": "parent",
@@ -965,11 +1088,45 @@ INVERSE_REL = {
     "parent": "child",
 }
 
-# Map internal neutral roles back to prompt-friendly labels
-ROLE_PROMPT_ALIASES = {
-    "child": "child",
-    "parent": "parent",
-}
+def _inverse_relation(rel: str, other_gender: Optional[str] = None, me_gender: Optional[str] = None) -> Optional[str]:
+    """Compute inverse of `rel` (how other should view me), using gender when known."""
+    rel = (rel or "").strip().lower()
+    og = (other_gender or "").strip().lower() or None
+    mg = (me_gender or "").strip().lower() or None
+
+    if rel in ("wife", "husband", "friend"):
+        return INVERSE_REL[rel]
+    if rel == "sister":
+        return "brother" if og == "male" else ("sister" if og == "female" else "sibling")
+    if rel == "brother":
+        return "sister" if og == "female" else ("brother" if og == "male" else "sibling")
+    # I set other as daughter/son → other views me as mother/father based on MY gender
+    if rel == "daughter" or rel == "son":
+        if mg == "female":
+            return "mother"
+        if mg == "male":
+            return "father"
+        return "parent"
+    # I set other as mother/father → other views me as son/daughter based on OTHER's gender
+    if rel in ("mother", "father"):
+        if og == "female":
+            return "daughter"
+        if og == "male":
+            return "son"
+        return "child"
+    if rel == "parent":
+        if og == "female":
+            return "daughter"
+        if og == "male":
+            return "son"
+        return "child"
+    if rel == "child":
+        if mg == "female":
+            return "mother"
+        if mg == "male":
+            return "father"
+        return "parent"
+    return INVERSE_REL.get(rel)
 
 async def resolve_target_role_for_reply(speaker_id: str, target_id: str) -> str:
     """
@@ -979,13 +1136,49 @@ async def resolve_target_role_for_reply(speaker_id: str, target_id: str) -> str:
     await get_mongo_client()
     doc = await relationships_col.find_one({"user_id": target_id, "other_user_id": speaker_id})
     role = (doc or {}).get("relation", "").strip().lower()
-    if role and role not in ("", "friend"):
+    if role and role not in ("", "friend", "child", "parent", "sibling"):
+        return role
+    if role in ("child", "parent", "sibling"):
+        # Prefer gendered label for prompts when possible
+        sp = await users_col.find_one({"user_id": speaker_id})
+        tg = await users_col.find_one({"user_id": target_id})
+        sg = (sp or {}).get("gender")
+        if role == "child":
+            if sg == "female":
+                return "daughter"
+            if sg == "male":
+                return "son"
+        if role == "parent":
+            tg_g = (tg or {}).get("gender")
+            if tg_g == "female":
+                return "mother"
+            if tg_g == "male":
+                return "father"
         return role
     # Fallback: invert the speaker's declared relation to target
     rev = await relationships_col.find_one({"user_id": speaker_id, "other_user_id": target_id})
     if rev and rev.get("relation"):
-        inv = INVERSE_REL.get(str(rev["relation"]).strip().lower())
+        sp = await users_col.find_one({"user_id": speaker_id})
+        tg = await users_col.find_one({"user_id": target_id})
+        inv = _inverse_relation(
+            str(rev["relation"]),
+            other_gender=(tg or {}).get("gender"),
+            me_gender=(sp or {}).get("gender"),
+        )
         if inv:
+            # Map neutrals to prompt-friendly when gender known
+            if inv == "child":
+                sg = (sp or {}).get("gender")
+                if sg == "female":
+                    return "daughter"
+                if sg == "male":
+                    return "son"
+            if inv == "parent":
+                tg_g = (tg or {}).get("gender")
+                if tg_g == "female":
+                    return "mother"
+                if tg_g == "male":
+                    return "father"
             return inv
     return role if role else "friend"
 
@@ -1001,20 +1194,25 @@ async def rel_set(req: RelationshipSetRequest, sess=Depends(require_session), _:
     if rel not in allowed:
         raise HTTPException(status_code=400, detail=f"Invalid relation. Allowed: {sorted(allowed)}")
 
+    me = await users_col.find_one({"user_id": me_id})
+    other = await users_col.find_one({"user_id": req.other_user_id})
+    if not other:
+        raise HTTPException(status_code=404, detail="Other user not found")
+
     # forward: me -> other
     await relationships_col.update_one(
         {"user_id": me_id, "other_user_id": req.other_user_id},
         {"$set": {"relation": rel, "updated_at": now}},
         upsert=True
     )
-    # inverse: only auto-write when mapping is safe/symmetric; do not overwrite
-    # an explicit relation the other user already set.
-    inv = INVERSE_REL.get(rel)
+    # inverse: gender-aware; do not overwrite a strong explicit relation
+    inv = _inverse_relation(rel, other_gender=(other or {}).get("gender"), me_gender=(me or {}).get("gender"))
     if inv:
         existing = await relationships_col.find_one(
             {"user_id": req.other_user_id, "other_user_id": me_id}
         )
-        if not existing or not existing.get("relation") or existing.get("relation") in ("friend", "child", "parent"):
+        soft = (None, "", "friend", "child", "parent", "sibling")
+        if not existing or (existing.get("relation") in soft):
             await relationships_col.update_one(
                 {"user_id": req.other_user_id, "other_user_id": me_id},
                 {"$set": {"relation": inv, "updated_at": now}},
@@ -1255,20 +1453,39 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
             continue
         
         uids = base.get("user_id", [])
-        if isinstance(uids, list):
-            if user_id not in uids:
-                continue
-        else:
-            if uids != user_id:
-                continue
+        if not isinstance(uids, list):
+            uids = [uids] if uids else []
 
-        if item_type=="journal":
+        # Privacy: only memories that belong to the AI Twin owner (user_id = target)
+        if user_id not in uids:
+            continue
+
+        if item_type == "journal":
+            # Journals are private to the twin — reject if shared with anyone else
+            if set(uids) - {user_id}:
+                continue
             base["speaker_name"] = target_name
+        else:
+            # Conversations: prefer those involving the current speaker (pair context)
+            # Still allow other twin-owned convos at lower score
+            pass
 
-        adjusted = 1.0 - score
-        if item_type=="journal": adjusted += 0.9
-        elif md.get("speaker_id")==speaker_id or md.get("target_id")==user_id: adjusted += 0.7
-        if speaker_name.lower() in base.get("content","").lower() or target_name.lower() in base.get("content","").lower():
+        adjusted = 1.0 - float(score)
+        if item_type == "journal":
+            adjusted += 0.9
+        else:
+            pair_hit = (
+                (md.get("speaker_id") == speaker_id and md.get("target_id") == user_id)
+                or (md.get("speaker_id") == user_id and md.get("target_id") == speaker_id)
+                or (base.get("speaker_id") == speaker_id)
+            )
+            if pair_hit:
+                adjusted += 0.7
+            elif speaker_id in uids:
+                adjusted += 0.35
+            else:
+                adjusted += 0.1  # twin's other chats — weak signal only
+        if speaker_name.lower() in base.get("content", "").lower() or target_name.lower() in base.get("content", "").lower():
             adjusted += 0.3
         ts = as_utc_aware(md.get("timestamp")) or as_utc_aware(base.get("timestamp"))
         days_old = (datetime.now(pytz.UTC) - ts).days if ts else 9999
@@ -1492,6 +1709,9 @@ def require_api_and_session(sess=Depends(require_session), _: None = Depends(req
 async def send_message(req: MessageRequest, sess=Depends(require_api_and_session)):
     if sess["user"]["user_id"] != req.speaker_id:
         raise HTTPException(status_code=403, detail="Sender mismatch")
+    uid = sess["user"]["user_id"]
+    if not _rate_allow(f"send:{uid}", RATE_SEND_PER_MIN):
+        raise HTTPException(status_code=429, detail="Too many messages — slow down a bit.")
     await save_and_embed_message(req.speaker_id, req.target_id, req.user_input, source="human")
     tg = await users_col.find_one({"user_id": req.target_id})
     if tg and tg.get("ai_enabled", False):
@@ -1525,6 +1745,9 @@ async def history_with(other_id: str, limit: int = 30, sess=Depends(require_api_
 async def journals_add(req: JournalAddRequest, sess=Depends(require_api_and_session)):
     if not req.consent:
         raise HTTPException(status_code=400, detail="Consent required: please confirm the checkbox.")
+    uid = sess["user"]["user_id"]
+    if not _rate_allow(f"journal:{uid}", RATE_JOURNAL_PER_MIN):
+        raise HTTPException(status_code=429, detail="Too many journal entries — try again shortly.")
     await get_mongo_client()
     now = datetime.now(pytz.UTC)
     entry_id = str(uuid.uuid4())
@@ -1588,6 +1811,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 to = msg.get("to")
                 text = (msg.get("text") or "").strip()
                 if not to or not text:
+                    continue
+                if not _rate_allow(f"send:{user_id}", RATE_SEND_PER_MIN):
+                    try:
+                        await websocket.send_json({
+                            "type": "ai", "from": to,
+                            "payload": {
+                                "speaker_id": to, "target_id": user_id,
+                                "content": "You're sending messages too fast — wait a moment.",
+                                "source": "system",
+                                "timestamp": datetime.now(pytz.UTC).isoformat()
+                            }
+                        })
+                    except Exception:
+                        pass
                     continue
                 try:
                     saved = await save_and_embed_message(user_id, to, text, source="human")
