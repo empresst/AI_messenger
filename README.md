@@ -1,7 +1,8 @@
 # 🧠 AI Messenger
 
 ![AI Messenger Preview](r.png)
-This image shows how Nipa's AI twin replying as her based on her journal context about her likes-dislikes about hiking, kite flying, and her match timing that she is busy in that week.
+
+# This image shows how Nipa's AI twin replying as her based on her journal context about her likes-dislikes about hiking, kite flying, and her match timing that she is busy in that week.
 
 ## 📌 Overview
 AI Messenger is a personal companion app where people can **chat with themselves and family members** in a safe and private space.  
