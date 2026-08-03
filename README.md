@@ -1,6 +1,7 @@
 # 🧠 AI Messenger
 
 ![AI Messenger Preview](r.png)
+This image shows how Nipa's AI twin replying as her based on her journal context about her likes-dislikes about hiking, kite flying, and her match timing that she is busy in that week.
 
 ## 📌 Overview
 AI Messenger is a personal companion app where people can **chat with themselves and family members** in a safe and private space.  
@@ -31,4 +32,4 @@ pass- password
 or signup and set relationship with them
 
 
-here you can talk with your family members and they can talk with you the same as you would do even if you are absent.
+here you can talk with your family members and they can talk with you the same as you would do even if you are busy.
