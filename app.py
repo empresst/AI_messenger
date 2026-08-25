@@ -71,6 +71,11 @@ PERSONALITY_CACHE_TTL_H = int(os.getenv("PERSONALITY_CACHE_TTL_H", "24"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "8"))
 FAISS_SAVE_DEBOUNCE_S = float(os.getenv("FAISS_SAVE_DEBOUNCE_S", "2.0"))
 
+CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-20b")
+ANALYSIS_MODEL = os.getenv("GROQ_ANALYSIS_MODEL", CHAT_MODEL)
+STARTUP_STATUS: Dict[str, Any] = {"mongo": "unchecked", "models": "unchecked"}
+
+
 if not MONGODB_URI:
     raise RuntimeError("MONGODB_URI missing")
 if not GROQ_API_KEY:
@@ -379,7 +384,29 @@ class ConnectionManager:
                 pass
 
 manager = ConnectionManager()
+# early knock if wrong
 
+async def run_startup_checks():
+    try:
+        await get_mongo_client()
+        await client.admin.command("ping")
+        STARTUP_STATUS["mongo"] = "ok"
+    except Exception as e:
+        STARTUP_STATUS["mongo"] = "FAIL"
+        logger.error(f"STARTUP: Mongo unreachable — {e}")
+
+    try:
+        c = await get_openai_client()
+        available = {m.id for m in (await c.models.list()).data}
+        missing = [m for m in {CHAT_MODEL, ANALYSIS_MODEL} if m not in available]
+        if missing:
+            STARTUP_STATUS["models"] = "MISSING"
+            logger.error(f"STARTUP: model(s) unavailable {missing} — replies will fall back to canned text")
+        else:
+            STARTUP_STATUS["models"] = "ok"
+    except Exception as e:
+        STARTUP_STATUS["models"] = "FAIL"
+        logger.error(f"STARTUP: Groq API unreachable — {e}")
 # ---------------------
 # FastAPI app (+ healthcheck)
 # ---------------------
@@ -387,6 +414,10 @@ manager = ConnectionManager()
 async def lifespan(app: FastAPI):
     global watcher_task
     await initialize_db()
+    try:
+        await asyncio.wait_for(run_startup_checks(), timeout=10)
+    except asyncio.TimeoutError:
+        logger.error("STARTUP: checks timed out")
     watcher_task = asyncio.create_task(watch_collections())
     yield
     if watcher_task:
@@ -409,9 +440,8 @@ app.add_middleware(
 
 @app.get("/healthz")
 async def healthz():
-    # Keep this independent of DB/OpenAI so Render health checks succeed
-    return {"ok": True}
-
+    ok = STARTUP_STATUS["mongo"] == "ok" and STARTUP_STATUS["models"] == "ok"
+    return {"ok": ok, **STARTUP_STATUS}
 # ---------------------
 # Pydantic models
 # ---------------------
@@ -1374,12 +1404,14 @@ async def generate_personality_traits(user_id: str) -> dict:
     for attempt in range(3):
         try:
             resp = await (await get_openai_client()).chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=ANALYSIS_MODEL,
                 messages=[
-                    {"role":"system","content":"You are a helpful assistant that generates personality traits."},
+                    {"role":"system","content":"You generate personality traits. Return only valid JSON."},
                     {"role":"user","content":big_five_prompt}
                 ],
-                max_tokens=700, temperature=0.7
+                max_tokens=2000, temperature=0.7,
+                extra_body={"reasoning_effort": "low"}
+                response_format={"type": "json_object"},
             )
             txt = resp.choices[0].message.content.strip()
             txt = re.sub(r'^```json\s*|\s*```$', '', txt, flags=re.MULTILINE).strip()
@@ -1451,11 +1483,13 @@ async def get_greeting_and_tone(bot_role: str, target_id: str) -> Tuple[str,str]
     for attempt in range(3):
         try:
             resp = await (await get_openai_client()).chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=ANALYSIS_MODEL,
                 messages=[
                     {"role":"system","content":"Return only valid JSON with 'greeting' and 'tone' keys."},
                     {"role":"user","content":prompt}
-                ], max_tokens=100, temperature=0.5
+                ], max_tokens=500, temperature=0.7,
+                extra_body={"reasoning_effort": "low"}
+                response_format={"type": "json_object"},
             )
             txt = resp.choices[0].message.content.strip()
             txt = re.sub(r'^```json\s*|\s*```$','',txt, flags=re.MULTILINE).strip()
@@ -1873,16 +1907,18 @@ async def generate_response(
     )
     try:
         resp = await (await get_openai_client()).chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=120,
+            max_tokens=600,
             temperature=0.55,
+            extra_body={"reasoning_effort": "low"}
         )
         text = resp.choices[0].message.content.strip()
-        if len(text.split()) >= 4 and ((use_greeting and text.lower().startswith(greeting.lower())) or not use_greeting):
+#        if len(text.split()) >= 4 and ((use_greeting and text.lower().startswith(greeting.lower())) or not use_greeting):
+        if text and ((use_greeting and text.lower().startswith(greeting.lower())) or not use_greeting):
             parts = text.split(". ")[:3]
             text = ". ".join([p for p in parts if p]).strip()
             if text and not text.endswith("."):
