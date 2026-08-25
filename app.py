@@ -1410,7 +1410,7 @@ async def generate_personality_traits(user_id: str) -> dict:
                     {"role":"user","content":big_five_prompt}
                 ],
                 max_tokens=2000, temperature=0.7,
-                extra_body={"reasoning_effort": "low"}
+                extra_body={"reasoning_effort": "low"},
                 response_format={"type": "json_object"},
             )
             txt = resp.choices[0].message.content.strip()
@@ -1488,7 +1488,7 @@ async def get_greeting_and_tone(bot_role: str, target_id: str) -> Tuple[str,str]
                     {"role":"system","content":"Return only valid JSON with 'greeting' and 'tone' keys."},
                     {"role":"user","content":prompt}
                 ], max_tokens=500, temperature=0.7,
-                extra_body={"reasoning_effort": "low"}
+                extra_body={"reasoning_effort": "low"},
                 response_format={"type": "json_object"},
             )
             txt = resp.choices[0].message.content.strip()
