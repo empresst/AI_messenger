@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
+from demo_data import DEMO_USERS, DEMO_RELATIONSHIPS, DEMO_JOURNALS, DEMO_CONVERSATIONS, DEMO_PASSWORD
 
 # LangChain / FAISS / OpenAI
 from cachetools import TTLCache
@@ -2347,30 +2348,6 @@ async def watch_collections():
 # ---------------------
 # Demo seed / initialization
 # ---------------------
-async def clear_database():
-    await get_mongo_client()
-    await users_col.delete_many({})
-    await conversations_col.delete_many({})
-    await journals_col.delete_many({})
-    await embeddings_col.delete_many({})
-    await relationships_col.delete_many({})
-    await sessions_col.delete_many({})
-
-async def populate_users():
-    now = datetime.now(pytz.UTC)
-    def mkuser(uid, uname, name):
-        h=hash_password("password")
-        return {"user_id": uid, "username": uname, "display_name": name, "password_salt":h["salt"], "password_hash":h["hash"], "ai_enabled": False, "created_at": now, "last_seen": now}
-    base = [
-        mkuser("user1","nipa","Nipa"),
-        mkuser("user2","nick","Nick"),
-        mkuser("user3","arif","Arif"),
-        mkuser("user4","diana","Diana")
-    ]
-    for u in base:
-        if not await users_col.find_one({"user_id": u["user_id"]}):
-            await users_col.insert_one(u)
-
 async def batch_embed_texts(texts: List[str]):
     try:
         loop = asyncio.get_event_loop()
@@ -2378,56 +2355,68 @@ async def batch_embed_texts(texts: List[str]):
     except Exception:
         return [None]*len(texts)
 
-async def populate_conversations():
-    now = datetime.now(pytz.UTC)
-    convs = [
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user1","user2"], "speaker_id":"user1","speaker_name":"Nipa","target_id":"user2","target_name":"Nick","content":"Hey nick, ready for the project?","type":"user_input","source":"human","timestamp": now - timedelta(days=1)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user2","user1"], "speaker_id":"user2","speaker_name":"Nick","target_id":"user1","target_name":"Nipa","content":"Yeah, let's do this!","type":"user_input","source":"human","timestamp": now - timedelta(days=1, hours=1)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user3","user4"], "speaker_id":"user3","speaker_name":"Arif","target_id":"user4","target_name":"Diana","content":"Diana, got any weekend plans?","type":"user_input","source":"human","timestamp": now - timedelta(days=2)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user4","user3"], "speaker_id":"user4","speaker_name":"Diana","target_id":"user3","target_name":"Arif","content":"Just chilling, you?","type":"user_input","source":"human","timestamp": now - timedelta(days=2, hours=1)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user1","user3"], "speaker_id":"user1","speaker_name":"Nipa","target_id":"user3","target_name":"Arif","content":"Dad, I want to go to disney","type":"user_input","source":"human","timestamp": now - timedelta(hours=12)},
-        {"conversation_id": str(uuid.uuid4()), "user_id":["user4","user2"], "speaker_id":"user4","speaker_name":"Diana","target_id":"user2","target_name":"Nick","content":"Nick, have you tried the new coffee shop yet?","type":"user_input","source":"human","timestamp": now - timedelta(hours=10)}
-    ]
-    for c in convs:
-        if not await conversations_col.find_one({"conversation_id": c["conversation_id"]}):
-            await conversations_col.insert_one(c)
-    embeddings_result = await batch_embed_texts([c["content"] for c in convs])
-    docs = []
-    for c, e in zip(convs, embeddings_result):
-        if e is not None and not await embeddings_col.find_one({"item_id": c["conversation_id"], "item_type":"conversation"}):
-            docs.append({
-                "item_id": c["conversation_id"], "item_type":"conversation", "user_id": c["user_id"],
-                "content": c["content"], "embedding": e, "timestamp": c["timestamp"],
-                "speaker_id": c["speaker_id"], "speaker_name": c["speaker_name"],
-                "target_id": c["target_id"], "target_name": c["target_name"]
-            })
-    if docs: await embeddings_col.insert_many(docs)
+def _demo_time(now: datetime, days_ago: int, hour: int, minute: int = 0) -> datetime:
+    return (now - timedelta(days=days_ago)).replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-async def populate_journals():
+async def seed_demo_family():
+    """Add the demo family from demo_data.py if it isn't there yet. Never deletes anything."""
+    await get_mongo_client()
+    if await users_col.find_one({"user_id": DEMO_USERS[0][0]}):
+        return
     now = datetime.now(pytz.UTC)
-    j = {"entry_id": str(uuid.uuid4()), "user_id": ["user1"], "content":"I am in love with Jack", "timestamp": now - timedelta(hours=6)}
-    if not await journals_col.find_one({"entry_id": j["entry_id"]}):
-        await journals_col.insert_one(j)
-    emb = (await batch_embed_texts([j["content"]]))[0]
-    if emb is not None and not await embeddings_col.find_one({"item_id": j["entry_id"], "item_type":"journal"}):
-        await embeddings_col.insert_one({"item_id": j["entry_id"], "item_type":"journal", "user_id": j["user_id"], "content": j["content"], "embedding": emb, "timestamp": j["timestamp"]})
+    names = {uid: name for uid, _, name, _, _ in DEMO_USERS}
 
-async def verify_data():
-    counts = {
-        "Users": await users_col.count_documents({}),
-        "Conversations": await conversations_col.count_documents({}),
-        "Journals": await journals_col.count_documents({}),
-        "Embeddings": await embeddings_col.count_documents({})
-    }
-    logger.info(f"DB counts: {counts}")
+    for uid, uname, name, gender, ai_on in DEMO_USERS:
+        if await users_col.find_one({"user_id": uid}):
+            continue
+        h = hash_password(DEMO_PASSWORD)
+        await users_col.insert_one({
+            "user_id": uid, "username": uname, "display_name": name,
+            "password_salt": h["salt"], "password_hash": h["hash"],
+            "ai_enabled": ai_on, "gender": gender, "created_at": now, "last_seen": now
+        })
+
+    for uid, other, rel in DEMO_RELATIONSHIPS:
+        await relationships_col.update_one(
+            {"user_id": uid, "other_user_id": other},
+            {"$set": {"relation": rel, "updated_at": now}},
+            upsert=True
+        )
+
+    journals = [{
+        "entry_id": str(uuid.uuid4()), "user_id": [uid], "content": text,
+        "timestamp": _demo_time(now, days, hour)
+    } for uid, days, hour, text in DEMO_JOURNALS]
+    convs = [{
+        "conversation_id": str(uuid.uuid4()), "user_id": [sp, tg],
+        "speaker_id": sp, "speaker_name": names[sp], "target_id": tg, "target_name": names[tg],
+        "content": text, "type": "user_input", "source": "human",
+        "timestamp": _demo_time(now, days, hour, minute)
+    } for sp, tg, days, hour, minute, text in DEMO_CONVERSATIONS]
+    await journals_col.insert_many(journals)
+    await conversations_col.insert_many(convs)
+
+    # embed everything in one batch so the AI twin can recall it straight away
+    vectors = await batch_embed_texts([d["content"] for d in journals + convs])
+    emb_docs = []
+    for j, e in zip(journals, vectors[:len(journals)]):
+        if e is not None:
+            emb_docs.append({"item_id": j["entry_id"], "item_type": "journal", "user_id": j["user_id"],
+                             "content": j["content"], "embedding": e, "timestamp": j["timestamp"]})
+    for c, e in zip(convs, vectors[len(journals):]):
+        if e is not None:
+            emb_docs.append({"item_id": c["conversation_id"], "item_type": "conversation", "user_id": c["user_id"],
+                             "content": c["content"], "embedding": e, "timestamp": c["timestamp"],
+                             "speaker_id": c["speaker_id"], "speaker_name": c["speaker_name"],
+                             "target_id": c["target_id"], "target_name": c["target_name"]})
+    if emb_docs:
+        await embeddings_col.insert_many(emb_docs)
+    logger.info(f"Demo family seeded: {len(DEMO_USERS)} users, {len(journals)} journals, "
+                f"{len(convs)} messages, {len(emb_docs)} embeddings")
 
 async def initialize_db():
     if SEED_DEMO:
-        await clear_database()
-        await populate_users()
-        await populate_conversations()
-        await populate_journals()
-        await verify_data()
+        await seed_demo_family()
     await initialize_faiss_store()
 
 # ---------------------
