@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from contextlib import asynccontextmanager
 
+import certifi
 import pytz
 import numpy as np
 from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, Depends, Query
@@ -63,7 +64,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional / unused (chat uses Gro
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI")
-PUBLIC_UI_API_KEY = os.getenv("PUBLIC_UI_API_KEY", "your-secure-api-key")
+PUBLIC_UI_API_KEY = os.getenv("PUBLIC_UI_API_KEY", "disabled")
 PORT = int(os.getenv("PORT", "8000"))
 SEED_DEMO = os.getenv("SEED_DEMO", "false").lower() == "true"
 SESSION_TTL_MIN = int(os.getenv("SESSION_TTL_MIN", "4320"))  # 3 days
@@ -193,7 +194,7 @@ async def get_mongo_client() -> AsyncIOMotorClient:
             client = AsyncIOMotorClient(
                 MONGODB_URI,
                 tls=True,
-                tlsAllowInvalidCertificates=True,
+                tlsCAFile=certifi.where(),
                 maxPoolSize=50,
                 minPoolSize=5,
                 maxIdleTimeMS=30000,
@@ -530,6 +531,8 @@ button.danger { background:var(--danger) }
 .actions button:disabled { opacity:.55; cursor:not-allowed }
 .small { font-size:12px; color:var(--muted) }
 .form-card { border:1px solid var(--border); border-radius:10px; padding:12px; background:var(--panel2) }
+.form-msg { min-height:16px; margin-top:4px }
+.form-msg.error { color:var(--danger) }
 .row { display:flex; gap:8px }
 .row > * { flex:1 }
 hr { border:0; border-top:1px solid var(--border); margin:12px 0 }
@@ -557,6 +560,7 @@ hr { border:0; border-top:1px solid var(--border); margin:12px 0 }
         <input id="loginUsername" placeholder="username"/>
         <input id="loginPassword" placeholder="password" type="password"/>
         <button id="loginBtn">Login</button>
+        <div id="loginMsg" class="small form-msg"></div>
       </div>
       <hr/>
       <div class="form-card">
@@ -571,10 +575,7 @@ hr { border:0; border-top:1px solid var(--border); margin:12px 0 }
           <option value="other">other</option>
         </select>
         <button id="signupBtn">Create account</button>
-      </div>
-      <div style="margin-top:10px">
-        <div class="small">Server key for UI (x-api-key)</div>
-        <input id="gatewayKey" placeholder="x-api-key (server key)" />
+        <div id="signupMsg" class="small form-msg"></div>
       </div>
     </section>
 
@@ -906,34 +907,82 @@ async function saveJournal(){
 }
 
 document.addEventListener('DOMContentLoaded', ()=>{
-  // Server key persistence
-  el('gatewayKey').value = localStorage.getItem('gw') || '';
-  API_KEY = el('gatewayKey').value;
-  el('gatewayKey').addEventListener('change', ()=>{ API_KEY = el('gatewayKey').value; localStorage.setItem('gw', API_KEY) });
+  // Show a message under a form; isError colours it red
+  function showMsg(id, text, isError=false){
+    const m = el(id);
+    m.innerText = text;
+    m.classList.toggle('error', isError);
+  }
 
-  // Login
-  el('loginBtn').onclick = async ()=>{
-    API_KEY = el('gatewayKey').value;
-    const username = el('loginUsername').value.trim();
-    const password = el('loginPassword').value.trim();
+  // Turn a failed request into something readable for the user
+  function errorText(e){
+    const raw = (e && e.message) || String(e);
+    try{
+      const detail = JSON.parse(raw).detail;
+      if(typeof detail === 'string') return detail;
+      if(Array.isArray(detail) && detail.length) return detail[0].msg || 'Please check the form';
+    }catch(_){}
+    if(e instanceof TypeError) return 'Could not reach the server. Please try again in a minute.';
+    return raw || 'Something went wrong. Please try again.';
+  }
+
+  // Run a request with the button disabled. The free server sleeps when idle,
+  // so after a few seconds tell the user it is waking up.
+  async function withBusy(btn, msgId, busyText, fn){
+    btn.disabled = true;
+    showMsg(msgId, busyText);
+    const slow = setTimeout(()=> showMsg(msgId, 'Waking up the server (free hosting), this can take up to a minute…'), 4000);
+    try{
+      return await fn();
+    }finally{
+      clearTimeout(slow);
+      btn.disabled = false;
+    }
+  }
+
+  async function doLogin(username, password){
     const res = await req('/auth/login','POST',{username,password});
     SESSION = res.token; ME = res.user;
     setAuthVisible(true); renderMe(); connectWS(); await refreshUsers(); await refreshJournal();
+  }
+
+  // Login
+  el('loginBtn').onclick = async ()=>{
+    const username = el('loginUsername').value.trim();
+    const password = el('loginPassword').value.trim();
+    if(!username || !password){ showMsg('loginMsg', 'Enter your username and password', true); return; }
+    try{
+      await withBusy(el('loginBtn'), 'loginMsg', 'Logging in…', ()=> doLogin(username, password));
+      showMsg('loginMsg', '');
+    }catch(e){
+      showMsg('loginMsg', errorText(e), true);
+    }
   };
 
-  // Signup
+  // Signup, then log straight in
   el('signupBtn').onclick = async ()=>{
-    API_KEY = el('gatewayKey').value;
     const username = el('signupUsername').value.trim();
     const display_name = el('signupDisplayName').value.trim() || username;
     const password = el('signupPassword').value.trim();
     const gender = (el('signupGender').value || '').trim() || null;
-    if(!username || !password){ alert('Username and password required'); return; }
+    if(username.length < 3){ showMsg('signupMsg', 'Username must be at least 3 characters', true); return; }
+    if(password.length < 6){ showMsg('signupMsg', 'Password must be at least 6 characters', true); return; }
     const body = {username, display_name, password};
     if(gender) body.gender = gender;
-    await req('/auth/signup','POST', body);
-    alert('Signed up! Now login using the Login form above.');
+    try{
+      await withBusy(el('signupBtn'), 'signupMsg', 'Creating your account…', async ()=>{
+        await req('/auth/signup','POST', body);
+        await doLogin(username, password);
+      });
+      showMsg('signupMsg', '');
+    }catch(e){
+      showMsg('signupMsg', errorText(e), true);
+    }
   };
+
+  // Enter key submits the matching form
+  ['loginUsername','loginPassword'].forEach(id => el(id).addEventListener('keydown', e => { if(e.key==='Enter') el('loginBtn').click() }));
+  ['signupUsername','signupDisplayName','signupPassword'].forEach(id => el(id).addEventListener('keydown', e => { if(e.key==='Enter') el('signupBtn').click() }));
 
   // Logout
   el('logoutBtn').onclick = async ()=>{
@@ -1017,20 +1066,31 @@ def _user_public(u: dict) -> dict:
         "gender": u.get("gender"),
     }
 
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+
+def _username_query(username: str) -> dict:
+    # case-insensitive exact match, so "Nipa" and "nipa" are the same account
+    return {"username": {"$regex": f"^{re.escape(username)}$", "$options": "i"}}
+
 @app.post("/auth/signup")
 async def signup(req: SignupRequest, _: None = Depends(require_api_key)):
     await get_mongo_client()
-    existing = await users_col.find_one({"username": req.username})
+    username = req.username.strip()
+    if not USERNAME_RE.match(username):
+        raise HTTPException(status_code=400, detail="Username must be 3-32 characters: letters, numbers, _ . -")
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    existing = await users_col.find_one(_username_query(username))
     if existing:
-        raise HTTPException(status_code=400, detail="Username taken")
+        raise HTTPException(status_code=400, detail="That username is already taken")
     user_id = f"user_{uuid.uuid4().hex[:8]}"
     h = hash_password(req.password)
     now = datetime.now(pytz.UTC)
     gender = _normalize_gender(req.gender)
     doc = {
         "user_id": user_id,
-        "username": req.username,
-        "display_name": req.display_name,
+        "username": username.lower(),
+        "display_name": req.display_name.strip() or username,
         "password_salt": h["salt"],
         "password_hash": h["hash"],
         "ai_enabled": False,
@@ -1044,11 +1104,11 @@ async def signup(req: SignupRequest, _: None = Depends(require_api_key)):
 @app.post("/auth/login")
 async def login(req: LoginRequest, _: None = Depends(require_api_key)):
     await get_mongo_client()
-    user = await users_col.find_one({"username": req.username})
+    user = await users_col.find_one(_username_query(req.username.strip()))
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Wrong username or password")
     if not verify_password(req.password, user.get("password_salt",""), user.get("password_hash","")):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Wrong username or password")
     token = await create_session(user["user_id"])
     await users_col.update_one({"user_id": user["user_id"]}, {"$set": {"last_seen": datetime.now(pytz.UTC)}})
     return {"token": token, "user": _user_public(user)}
