@@ -235,7 +235,7 @@ class FixedMemoryPipeline(MemoryPipeline):
         for d, i in zip(dist[0], idx[0]):
             if 1.0 - float(d) / 2.0 < self.min_sim:
                 continue
-            if len(out) >= 12:  # app.py stops after max_memories * 4 survivors
+            if len(out) >= 18:  # app.py checks at most max_memories * 6 candidates
                 break
             it = self.items[i]
             uids = list(it.user_id)

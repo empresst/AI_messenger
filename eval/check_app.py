@@ -49,12 +49,17 @@ class Coll:
         return next((r for r in self.rows.values() if r.get(k) == v), None)
     async def update_one(self, *a, **kw): self.updates.append(a)
     def find(self, q):
-        rows = [r for r in self.rows.values() if all(
-            (r.get(k) == v) if not isinstance(v, dict) else (any(x in r.get(k, []) for x in v["$in"]))
-            for k, v in q.items())]
+        def match(r, k, v):
+            if not isinstance(v, dict):
+                return r.get(k) == v
+            field = r.get(k, [])
+            vals = v["$in"]
+            return any(x in field for x in vals) if isinstance(field, list) else field in vals
+        rows = [r for r in self.rows.values() if all(match(r, k, v) for k, v in q.items())]
         class Cur:
-            def sort(s, *a): rows.sort(key=lambda r: r["timestamp"], reverse=True); return s
-            def limit(s, n): s.rows = rows[:n]; return s
+            def __init__(s): s.rows = rows
+            def sort(s, *a): s.rows.sort(key=lambda r: r["timestamp"], reverse=True); return s
+            def limit(s, n): s.rows = s.rows[:n]; return s
             def __aiter__(s): s.it = iter(s.rows); return s
             async def __anext__(s):
                 try: return next(s.it)

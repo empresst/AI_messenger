@@ -219,6 +219,9 @@ def as_utc_aware(dt: Optional[datetime]) -> Optional[datetime]:
 # ---------------------
 # Lazy init functions
 # ---------------------
+_indexes_ready = False
+
+
 async def get_mongo_client() -> AsyncIOMotorClient:
     global client, db, users_col, conversations_col, journals_col, embeddings_col, personalities_col
     global errors_col, saved_greetings_col, greetings_cache_col, relationships_col, sessions_col
@@ -245,7 +248,11 @@ async def get_mongo_client() -> AsyncIOMotorClient:
             relationships_col = db["relationships"]
             sessions_col = db["sessions"]
 
-    # indexes
+    # indexes: once per process (each create_index is a round trip to MongoDB, and this
+    # function is called at the start of nearly every request step)
+    global _indexes_ready
+    if _indexes_ready:
+        return client
     await conversations_col.create_index([("user_id", 1), ("timestamp", -1)])
     await conversations_col.create_index([("speaker_id", 1), ("target_id", 1), ("timestamp", -1)])
     await conversations_col.create_index([("content", "text")])
@@ -258,6 +265,7 @@ async def get_mongo_client() -> AsyncIOMotorClient:
     await greetings_cache_col.create_index([("key", 1), ("timestamp", -1)])
     await relationships_col.create_index([("user_id", 1), ("other_user_id", 1)], unique=True)
     await sessions_col.create_index("expires_at", expireAfterSeconds=0)
+    _indexes_ready = True
 
     return client
 
@@ -1644,30 +1652,43 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
         None, lambda: faiss_store.similarity_search_with_score(user_input, k=k)
     )
 
-    mems = []
+    # 1) cheap filters on FAISS metadata, in similarity order
+    picked = []
     for doc, dist in results:
-        if len(mems) >= max_memories * 4:
-            break  # results arrive in similarity order; enough survivors to rank
+        if len(picked) >= max_memories * 6:
+            break  # results arrive in similarity order; enough candidates to rank
         md = doc.metadata or {}
         item_id = md.get("item_id")
         item_type = md.get("item_type")
         if not item_id or not item_type:
             continue
-
-        # Fast reject from FAISS metadata before DB lookup
         md_uids = _as_uid_list(md.get("user_id"))
         if md_uids and user_id not in md_uids:
             continue
         if item_type == "journal" and md_uids and set(md_uids) != {user_id}:
             continue
-
+        if item_type == "conversation" and md_uids and set(md_uids) != {speaker_id, user_id}:
+            continue
         cos = 1.0 - float(dist) / 2.0  # FAISS L2 distance on unit vectors
         if cos < MEMORY_MIN_SIM:
             continue
+        picked.append((md, item_id, item_type, cos))
 
-        col = conversations_col if item_type == "conversation" else journals_col
-        id_field = "conversation_id" if item_type == "conversation" else "entry_id"
-        base = await col.find_one({id_field: item_id})
+    # 2) one database query per collection instead of one per candidate
+    conv_ids = [i for _, i, t, _ in picked if t == "conversation"]
+    jour_ids = [i for _, i, t, _ in picked if t != "conversation"]
+    bases = {}
+    if conv_ids:
+        async for d in conversations_col.find({"conversation_id": {"$in": conv_ids}}):
+            bases[("conversation", d["conversation_id"])] = d
+    if jour_ids:
+        async for d in journals_col.find({"entry_id": {"$in": jour_ids}}):
+            bases[("journal", d["entry_id"])] = d
+
+    # 3) authoritative privacy checks on the stored documents
+    mems = []
+    for md, item_id, item_type, cos in picked:
+        base = bases.get(("conversation" if item_type == "conversation" else "journal", item_id))
         if not base:
             continue
 
