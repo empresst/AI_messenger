@@ -18,7 +18,7 @@ from eval.pipeline import build_items, FixedMemoryPipeline
 src = (__import__("pathlib").Path(__file__).resolve().parents[1] / "app.py").read_text()
 tree = ast.parse(src)
 want = {"find_relevant_memories", "should_include_memories", "_is_lightweight_input", "_as_uid_list",
-        "as_utc_aware", "generate_personality_traits", "_normalize_traits"}
+        "as_utc_aware", "generate_personality_traits", "_normalize_traits", "_with_journal_slot"}
 code = "\n\n".join(ast.get_source_segment(src, n) for n in tree.body
                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in want)
 
@@ -90,8 +90,20 @@ def retrieve(asker, twin, text):
 
 app_r = score(retrieve)
 off_r = score(FixedMemoryPipeline(items, names, E, NOW).retrieve)
-for k in ["hit@1", "hit@3", "privacy_probe_leak_rate", "cross_thread_share"]:
+for k in ["hit@1", "hit@2", "hit@3", "privacy_probe_leak_rate", "cross_thread_share"]:
     print(f"{k:26s} app.py {app_r[k]:.3f}   offline copy {off_r[k]:.3f}")
+
+# Messages already shown as chat history are not returned again, and duplicate index entries collapse
+fs = ns["faiss_store"]
+fs.docs.append(fs.docs[[d.metadata["item_id"] for d in fs.docs].index("c_16")])          # duplicate entry
+fs.index.add(E.documents([fs.docs[-1].page_content]).astype("float32"))
+ok, mems = asyncio.run(ns["should_include_memories"]("Do you need anything for the Srimangal trip?", "u5", "u1"))
+ids = [next(it.item_id for it in items if it.content == m["content"]) for m in mems]
+print("duplicate collapsed:", len(ids) == len(set(ids)), ids)
+ok, mems2 = asyncio.run(ns["should_include_memories"]("Do you need anything for the Srimangal trip?", "u5", "u1",
+                                                      exclude_ids={"c_16", "c_15"}))
+ids2 = [next(it.item_id for it in items if it.content == m["content"]) for m in mems2]
+print("history excluded:", not ({"c_16", "c_15"} & set(ids2)), ids2)
 
 # Personality: failing LLM must not be cached; journals must be in the prompt
 captured = {}

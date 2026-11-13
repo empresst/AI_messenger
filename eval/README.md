@@ -15,7 +15,7 @@ The evaluation led to the retrieval changes in `app.py` described below.
   - the updated retrieval now in `app.py`.
   - [`check_app.py`](check_app.py) runs the real functions from `app.py` against a fake database built from the benchmark, and confirms they give the same numbers as the offline copy.
 - **Metrics:**
-  - Hit@1 / Hit@3 / MRR on the memories the twin actually receives (at most 3);
+  - Hit@1 / Hit@2 / Hit@3 / MRR on the memories retrieval returns (the reply prompt uses the first two);
   - privacy-probe leaks (another person's journal, or a chat the twin was not in);
   - the twin's messages from *another* chat being shown to the current asker;
   - how often inputs with nothing to recall still pull in memories.
@@ -36,13 +36,13 @@ Results are written to [`results/`](results/).
 
 Full table with all ablations: [`results/local.md`](results/local.md).
 
-| Configuration | Hit@1 | Hit@3 | MRR | Privacy-probe leaks | Messages from another chat shown | Unrelated question → memories |
-|---|---|---|---|---|---|---|
-| **Updated pipeline (current `app.py`)** | **87%** | **98%** | **0.93** | 0/20 | 0% | 100% |
-| Updated, with `MEMORY_MIN_SIM=0.55` | 85% | 97% | 0.91 | 0/20 | 0% | 0% |
-| Previous pipeline (`81ed922`) | 33% | 63% | 0.47 | 0/20 | see finding 3 | 100% |
-| Previous, without privacy filters and boosts | 72% | 78% | 0.75 | **19/20 secrets retrieved** | – | 100% |
-| BM25 keyword baseline, same privacy rules | 52% | 73% | 0.61 | 0/20 | – | 100% |
+| Configuration | Hit@1 | Hit@2 | Hit@3 | MRR | Privacy-probe leaks | Messages from another chat shown | Unrelated question → memories |
+|---|---|---|---|---|---|---|---|
+| **Updated pipeline (current `app.py`)** | **87%** | **98%** | **98%** | **0.93** | 0/20 | 0% | 100% |
+| Updated, with `MEMORY_MIN_SIM=0.55` | 85% | 97% | 97% | 0.91 | 0/20 | 0% | 0% |
+| Previous pipeline (`81ed922`) | 33% | 53% | 63% | 0.47 | 0/20 | see finding 3 | 100% |
+| Previous, without privacy filters and boosts | 72% | – | 78% | 0.75 | **19/20 secrets retrieved** | – | 100% |
+| BM25 keyword baseline, same privacy rules | 52% | 67% | 73% | 0.61 | 0/20 | – | 100% |
 
 ### Findings and changes
 
@@ -58,6 +58,11 @@ Full table with all ablations: [`results/local.md`](results/local.md).
 6. **Smaller fixes found while reading the code:**
    - every message triggered one extra embedding API call whose result was never used (removed);
    - the second journal pass read only the 100 most recent journals of *all* users before filtering by owner, so older entries dropped out once the app held more than 100 journals. That pass is removed; the main search now covers the whole index with the same privacy filters.
+
+7. **Found in live testing, not by the benchmark.** The reply prompt uses only the first two memories, and in a live chat both places went to messages the twin could already see in the chat history, once to the very message being answered, which was also indexed twice by a race between the save and the database watcher. Nipa's journal saying she is busy on Saturday never reached the prompt, and she accepted an invitation that clashes with her football final. The benchmark has no ongoing chat thread, so it could not catch this.
+   **Changes:** messages already shown as chat history are skipped, duplicate index entries are collapsed, and the best-matching own journal gets one of the two places when it is within 0.10 cosine of the best memory. On the benchmark this keeps Hit@2 at 98%.
+8. **Replies took about 40 seconds.** Per-step timing logs showed that the embedding and LLM calls took about 1 second in total. Most of the time went to `get_mongo_client()`, which re-created all 12 MongoDB indexes, 12 round trips, at the start of nearly every step of a reply.
+   **Change:** indexes are created once per process, and memory candidates are fetched with one query per collection. A reply now takes about 6 seconds on Render's free tier.
 
 ### Personality traits (not evaluated, code fixes only)
 

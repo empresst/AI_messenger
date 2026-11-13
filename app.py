@@ -1625,7 +1625,8 @@ async def check_journals_for_user(user_id: str) -> List[dict]:
     return journals
 
 
-async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str, speaker_name: str, max_memories: int = 5) -> List[dict]:
+async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str, speaker_name: str, max_memories: int = 5,
+                                 exclude_ids: Optional[set] = None) -> List[dict]:
     """
     Retrieve memories for the AI Twin owner (`user_id` = target).
 
@@ -1653,7 +1654,8 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
     )
 
     # 1) cheap filters on FAISS metadata, in similarity order
-    picked = []
+    exclude_ids = exclude_ids or set()
+    picked, seen_ids = [], set()
     for doc, dist in results:
         if len(picked) >= max_memories * 6:
             break  # results arrive in similarity order; enough candidates to rank
@@ -1662,6 +1664,8 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
         item_type = md.get("item_type")
         if not item_id or not item_type:
             continue
+        if item_id in exclude_ids or item_id in seen_ids:
+            continue  # already in the visible chat history, or a duplicate index entry
         md_uids = _as_uid_list(md.get("user_id"))
         if md_uids and user_id not in md_uids:
             continue
@@ -1672,6 +1676,7 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
         cos = 1.0 - float(dist) / 2.0  # FAISS L2 distance on unit vectors
         if cos < MEMORY_MIN_SIM:
             continue
+        seen_ids.add(item_id)
         picked.append((md, item_id, item_type, cos))
 
     # 2) one database query per collection instead of one per candidate
@@ -1775,15 +1780,35 @@ def _is_lightweight_input(user_input: str) -> bool:
         return True
     return False
 
-async def should_include_memories(user_input: str, speaker_id: str, user_id: str) -> Tuple[bool, List[dict]]:
-    """Top memories by similarity, after the privacy filters in find_relevant_memories."""
+async def should_include_memories(user_input: str, speaker_id: str, user_id: str,
+                                  exclude_ids: Optional[set] = None) -> Tuple[bool, List[dict]]:
+    """Top memories by similarity, after the privacy filters in find_relevant_memories.
+
+    `exclude_ids`: messages already shown as chat history (including the one being answered).
+    The best-matching journal ("your note") gets one of the first two places when it is
+    nearly as similar as the best memory, because the prompt only uses two memories and
+    treats notes as the twin's private truth.
+    """
     if _is_lightweight_input(user_input):
         return False, []
 
     sp = await users_col.find_one({"user_id": speaker_id})
     speaker_name = (sp or {}).get("display_name") or (sp or {}).get("username") or speaker_id
-    mems = await find_relevant_memories(speaker_id, user_id, user_input, speaker_name, max_memories=3)
-    return (len(mems) > 0), mems
+    mems = await find_relevant_memories(speaker_id, user_id, user_input, speaker_name,
+                                        max_memories=6, exclude_ids=exclude_ids)
+    mems = _with_journal_slot(mems)
+    return (len(mems) > 0), mems[:3]
+
+
+def _with_journal_slot(mems: List[dict], margin: float = 0.10) -> List[dict]:
+    """Move the best own journal into the top two if it is within `margin` cosine of the best memory."""
+    if len(mems) < 2 or any(m.get("is_own_journal") for m in mems[:2]):
+        return mems
+    best = max(float(m.get("similarity", 0)) for m in mems)
+    for i, m in enumerate(mems):
+        if m.get("is_own_journal") and float(m.get("similarity", 0)) >= best - margin:
+            return [mems[0], m] + [x for j, x in enumerate(mems[1:], 1) if j != i]
+    return mems
 
 # ---------------------
 # initialize_bot (role auto-detect)
@@ -1849,7 +1874,8 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
         greeting, tone = await get_greeting_and_tone(role_in, target_id)
 
     with _timed("memories"):
-        include, mems = await should_include_memories(user_input, speaker_id, target_id)
+        shown = {m.get("conversation_id") for m in recent if m.get("conversation_id")}
+        include, mems = await should_include_memories(user_input, speaker_id, target_id, exclude_ids=shown)
     if lightweight:
         include, mems = False, []
 

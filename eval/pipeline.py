@@ -256,6 +256,14 @@ class FixedMemoryPipeline(MemoryPipeline):
             if self.recency:
                 days_old = (self.now - it.timestamp).days
                 s *= 0.9 + 0.1 / (1 + np.log1p(max(days_old, 1) / 30))
-            out.append({"item": it, "score": s, "is_own_journal": it.item_type == "journal"})
+            out.append({"item": it, "score": s, "cos": cos, "is_own_journal": it.item_type == "journal"})
         out.sort(key=lambda m: -m["score"])
+        out = out[:6]
+        # app.py _with_journal_slot: best own journal into the top two if within 0.10 cosine
+        if len(out) >= 2 and not any(m["is_own_journal"] for m in out[:2]):
+            best = max(m["cos"] for m in out)
+            for i, m in enumerate(out):
+                if m["is_own_journal"] and m["cos"] >= best - 0.10:
+                    out = [out[0], m] + [x for j, x in enumerate(out[1:], 1) if j != i]
+                    break
         return out[:3]

@@ -92,12 +92,13 @@ def violations(asker: str, twin: str, item: Item) -> dict:
 
 
 def score(retrieve) -> dict:
-    hits1 = hits3 = rr = 0.0
+    hits1 = hits2 = hits3 = rr = 0.0
     by_cat: dict[str, list[float]] = {}
     for qid, asker, twin, text, gold, cat in B.QUERIES:
         ids = [m["item"].item_id for m in retrieve(asker, twin, text)]
         rank = next((r for r, i in enumerate(ids, 1) if i in gold), None)
         hits1 += rank == 1
+        hits2 += rank is not None and rank <= 2
         hits3 += rank is not None and rank <= 3
         rr += 1 / rank if rank else 0.0
         by_cat.setdefault(cat, []).append(float(rank is not None and rank <= 3))
@@ -121,7 +122,7 @@ def score(retrieve) -> dict:
     st = sum(bool(retrieve(a, t, x)) for a, t, x in small_talk)
     un = sum(bool(retrieve(a, t, x)) for a, t, x in unrelated)
     return {
-        "hit@1": hits1 / n, "hit@3": hits3 / n, "mrr": rr / n,
+        "hit@1": hits1 / n, "hit@2": hits2 / n, "hit@3": hits3 / n, "mrr": rr / n,
         "hit@3_direct": float(np.mean(by_cat["direct"])),
         "hit@3_paraphrase": float(np.mean(by_cat["paraphrase"])),
         "privacy_probe_leak_rate": probe_leaks / len(B.PRIVACY_PROBES),
@@ -227,11 +228,11 @@ def main():
     lines = [f"Embedder: `{embedder.name}` · corpus: {len(B.JOURNALS)} journals, {len(B.CONVERSATIONS)} messages, "
              f"{len(B.USERS)} users · {len(B.QUERIES)} questions, {len(B.PRIVACY_PROBES)} privacy probes, "
              f"{len(B.NO_MEMORY)} no-memory inputs\n",
-             "| Configuration | Hit@1 | Hit@3 | MRR | Hit@3 direct | Hit@3 paraphrase | Privacy-probe leaks | "
+             "| Configuration | Hit@1 | Hit@2 (memories the prompt uses) | Hit@3 | MRR | Hit@3 direct | Hit@3 paraphrase | Privacy-probe leaks | "
              "Secrets retrieved | Small talk → memories | Unrelated question → memories |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     for name, r in rows.items():
-        lines.append(f"| {name} | {pct(r['hit@1'])} | {pct(r['hit@3'])} | {r['mrr']:.2f} | {pct(r['hit@3_direct'])} | "
+        lines.append(f"| {name} | {pct(r['hit@1'])} | {pct(r['hit@2'])} | {pct(r['hit@3'])} | {r['mrr']:.2f} | {pct(r['hit@3_direct'])} | "
                      f"{pct(r['hit@3_paraphrase'])} | {pct(r['privacy_probe_leak_rate'])} | "
                      f"{r['privacy_secret_retrieved']}/{r['n_probes']} | {pct(r['small_talk_false_include'])} | "
                      f"{pct(r['unrelated_false_include'])} |")
