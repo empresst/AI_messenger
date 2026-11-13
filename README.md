@@ -21,6 +21,19 @@ This way, AI Messenger becomes your **digital twin**, reflecting your own though
 
 ---
 
+## 📏 Retrieval evaluation
+
+The twin's memory retrieval is measured on a synthetic benchmark (60 questions, 20 privacy probes, 10 no-memory inputs) in [`eval/`](eval/README.md). The evaluation found that the previous ranking favoured recent journals over relevant ones and that a twin could repeat its own messages from other chats. After the fixes (local embedding model):
+
+| | Before | After |
+|---|---|---|
+| Right memory ranked first | 33% | 87% |
+| Right memory in the top 3 | 63% | 98% |
+| Other people's private journals retrieved (20 probes) | 0 | 0 |
+| Messages from other chats shown to the asker | possible | blocked |
+
+---
+
 https://ai-twin-fastapi.onrender.com/
 
 Here is the live link you can login with these names-

@@ -24,7 +24,6 @@ from dotenv import load_dotenv
 from demo_data import DEMO_USERS, DEMO_RELATIONSHIPS, DEMO_JOURNALS, DEMO_CONVERSATIONS, DEMO_PASSWORD
 
 # LangChain / FAISS / OpenAI
-from cachetools import TTLCache
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
@@ -70,6 +69,9 @@ PORT = int(os.getenv("PORT", "8000"))
 SEED_DEMO = os.getenv("SEED_DEMO", "false").lower() == "true"
 SESSION_TTL_MIN = int(os.getenv("SESSION_TTL_MIN", "4320"))  # 3 days
 PERSONALITY_CACHE_TTL_H = int(os.getenv("PERSONALITY_CACHE_TTL_H", "24"))
+# Minimum cosine similarity for a memory to be used. 0 = off. Calibrate per embedding
+# model with `python -m eval.run_eval --embedder gemini` before raising it.
+MEMORY_MIN_SIM = float(os.getenv("MEMORY_MIN_SIM", "0"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "8"))
 FAISS_SAVE_DEBOUNCE_S = float(os.getenv("FAISS_SAVE_DEBOUNCE_S", "2.0"))
 
@@ -109,7 +111,6 @@ mongo_lock = threading.Lock()
 openai_lock = threading.Lock()
 faiss_lock = threading.Lock()
 
-embedding_cache = TTLCache(maxsize=2000, ttl=3600)
 
 # Simple in-memory rate limits (per process; fine for single Render instance)
 _rate_buckets: Dict[str, list] = {}
@@ -1448,7 +1449,12 @@ async def generate_personality_traits(user_id: str) -> dict:
         j_uids = _as_uid_list(j.get("user_id"))
         if set(j_uids) == {user_id} or j_uids == [user_id]:
             own_journal_texts.append(j.get("content", ""))
-    data_text = "\n".join([c.get("content", "") for c in convs] + own_journal_texts)[:1500]
+    # Journals first and with half the budget: before, 80 chat messages came first and the
+    # 1500-character cut usually removed every journal.
+    budget = 4000
+    journal_part = "\n".join(own_journal_texts)[: budget // 2]
+    convs_part = "\n".join(c.get("content", "") for c in convs)[: budget - len(journal_part)]
+    data_text = "\n".join(p for p in (journal_part, convs_part) if p)
     if not data_text:
         return {"core_traits": {}, "sub_traits": []}
 
@@ -1462,6 +1468,7 @@ async def generate_personality_traits(user_id: str) -> dict:
     Ensure the response is concise to fit within 700 tokens.
     """
     traits = None
+    failed = False
     for attempt in range(3):
         try:
             resp = await (await get_openai_client()).chat.completions.create(
@@ -1470,7 +1477,7 @@ async def generate_personality_traits(user_id: str) -> dict:
                     {"role":"system","content":"You generate personality traits. Return only valid JSON."},
                     {"role":"user","content":big_five_prompt}
                 ],
-                max_tokens=2000, temperature=0.7,
+                max_tokens=2000, temperature=0.2,  # low: same text should give the same traits
                 extra_body={"reasoning_effort": "low"},
                 response_format={"type": "json_object"},
             )
@@ -1481,6 +1488,7 @@ async def generate_personality_traits(user_id: str) -> dict:
                 break
         except Exception:
             if attempt == 2:
+                failed = True
                 traits = {
                     "core_traits": {
                         "Openness":{"score":50,"explanation":"Neutral openness."},
@@ -1496,6 +1504,10 @@ async def generate_personality_traits(user_id: str) -> dict:
                     ]
                 }
     traits = _normalize_traits(traits or {"core_traits": {}, "sub_traits": []})
+    if failed:
+        # Don't cache the neutral fallback, or the twin stays generic for the whole TTL.
+        logger.warning(f"personality generation failed for {user_id}; using neutral traits without caching")
+        return traits
     await personalities_col.update_one(
         {"user_id": user_id},
         {"$set": {"traits": traits, "updated_at": datetime.now(pytz.UTC)}},
@@ -1580,32 +1592,31 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
 
     Privacy rules (strict):
     - Journals: ONLY the twin's private notes (owner list must be exactly [user_id]).
-    - Conversations: thread must include the twin; first-person facts only from twin's own messages.
+    - Conversations: only the thread between the twin and the current chat partner. The twin's own
+      messages to someone else are private to that chat and are not repeated to a third person.
     - Another person's journal must never appear.
+
+    Ranking: cosine similarity first. Own journal / own words and recency are small
+    tie-breakers, so they cannot outweigh relevance (see eval/README.md).
     """
     global faiss_store
     await ensure_faiss_store()
     await get_mongo_client()
     loop = asyncio.get_event_loop()
-    processed = await loop.run_in_executor(None, preprocess_input, user_input)
-    cache_key = f"input_{hash(processed)}"
-    if cache_key in embedding_cache:
-        _ = embedding_cache[cache_key]
-    else:
-        _ = await loop.run_in_executor(None, lambda: embeddings.embed_query(processed))
-        embedding_cache[cache_key] = _
 
     udoc = await users_col.find_one({"user_id": user_id})
     target_name = (udoc or {}).get("display_name") or (udoc or {}).get("username") or user_id
 
-    # Fetch extra candidates so ownership filtering still leaves enough hits
+    # Search the whole index; ownership filtering below decides what the twin may see.
+    k = max(int(getattr(faiss_store.index, "ntotal", 0)), 1)
     results = await loop.run_in_executor(
-        None, lambda: faiss_store.similarity_search_with_score(processed, k=max(max_memories * 8, 24))
+        None, lambda: faiss_store.similarity_search_with_score(user_input, k=k)
     )
-    logger.info(f"Retrieved {len(results)} FAISS candidates for query: {user_input}")
 
     mems = []
-    for doc, score in results:
+    for doc, dist in results:
+        if len(mems) >= max_memories * 4:
+            break  # results arrive in similarity order; enough survivors to rank
         md = doc.metadata or {}
         item_id = md.get("item_id")
         item_type = md.get("item_type")
@@ -1617,6 +1628,10 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
         if md_uids and user_id not in md_uids:
             continue
         if item_type == "journal" and md_uids and set(md_uids) != {user_id}:
+            continue
+
+        cos = 1.0 - float(dist) / 2.0  # FAISS L2 distance on unit vectors
+        if cos < MEMORY_MIN_SIM:
             continue
 
         col = conversations_col if item_type == "conversation" else journals_col
@@ -1634,6 +1649,9 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
         is_own_speech = (item_type == "conversation" and sp_id == user_id)
         is_own_journal = False
 
+        if item_type == "conversation" and set(uids) != {speaker_id, user_id}:
+            continue  # another thread: e.g. Mina's message to Rafi must not reach their father
+
         if item_type == "journal":
             # Strict private journal ownership — never another user's diary
             if set(uids) != {user_id}:
@@ -1642,16 +1660,9 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
             is_own_journal = True
             sp_name = target_name
             sp_id = user_id
-        else:
-            # Conversations must involve the twin; drop pure third-party threads
-            if user_id not in uids:
-                continue
-
-        adjusted = 1.0 - float(score)
-        if is_own_journal:
-            adjusted += 1.0  # strongest: twin's own private notes
+            bonus = 0.03
         elif is_own_speech:
-            adjusted += 0.75  # twin's own spoken words (safe as "I...")
+            bonus = 0.02
         else:
             # Only allow OTHER people's speech when they are the current chat partner.
             # Blocks e.g. Nick's lines leaking into Nipa↔Arif context.
@@ -1663,24 +1674,19 @@ async def find_relevant_memories(speaker_id: str, user_id: str, user_input: str,
             )
             if not pair_ok:
                 continue
-            adjusted += 0.2
-
-        if speaker_name.lower() in (base.get("content") or "").lower() or target_name.lower() in (base.get("content") or "").lower():
-            adjusted += 0.15
+            bonus = 0.0
 
         ts = as_utc_aware(md.get("timestamp")) or as_utc_aware(base.get("timestamp"))
         days_old = (datetime.now(pytz.UTC) - ts).days if ts else 9999
-        temporal_weight = 1 / (1 + np.log1p(max(days_old, 1) / 30))
-        adjusted *= temporal_weight
-
-        if adjusted < 0.3:
-            continue
+        recency = 1 / (1 + np.log1p(max(days_old, 1) / 30))
+        score = (cos + bonus) * (0.9 + 0.1 * recency)  # recency changes a score by at most 10%
 
         mems.append({
             "type": item_type,
             "content": base.get("content", ""),
             "timestamp": as_utc_aware(base.get("timestamp")),
-            "score": float(adjusted),
+            "score": float(score),
+            "similarity": float(cos),
             "user_id": uids,
             "speaker_id": sp_id,
             "speaker_name": sp_name,
@@ -1717,106 +1723,15 @@ def _is_lightweight_input(user_input: str) -> bool:
         return True
     return False
 
-async def semantic_own_journals(
-    user_id: str,
-    user_input: str,
-    max_n: int = 3,
-    min_sim: float = 0.28,
-) -> List[dict]:
-    """
-    Semantic search over the twin's private journals via stored embeddings.
-    Cosine similarity only — no keyword / intent lists.
-    """
-    await get_mongo_client()
-    loop = asyncio.get_event_loop()
-    processed = await loop.run_in_executor(None, preprocess_input, user_input)
-    try:
-        q_emb = await loop.run_in_executor(None, lambda: embeddings.embed_query(processed))
-    except Exception as e:
-        logger.warning(f"journal query embed failed: {e}")
-        return []
-
-    q = np.asarray(q_emb, dtype=float)
-    qn = np.linalg.norm(q)
-    if qn < 1e-9:
-        return []
-    q = q / qn
-
-    hits: List[dict] = []
-    cursor = embeddings_col.find({"item_type": "journal"}).sort("timestamp", -1).limit(100)
-    async for doc in cursor:
-        uids = _as_uid_list(doc.get("user_id"))
-        if set(uids) != {user_id}:
-            continue
-        emb = doc.get("embedding")
-        if not emb:
-            continue
-        v = np.asarray(emb, dtype=float)
-        vn = np.linalg.norm(v)
-        if vn < 1e-9:
-            continue
-        sim = float(np.dot(q, v / vn))
-        if sim < min_sim:
-            continue
-        content = (doc.get("content") or "").strip()
-        if not content:
-            base = await journals_col.find_one({"entry_id": doc.get("item_id")})
-            content = ((base or {}).get("content") or "").strip()
-        if not content:
-            continue
-        hits.append({
-            "type": "journal",
-            "content": content,
-            "timestamp": as_utc_aware(doc.get("timestamp")),
-            "score": sim + 0.45,  # own journals compete fairly with chat FAISS scores
-            "user_id": uids,
-            "speaker_id": user_id,
-            "speaker_name": None,
-            "is_own_journal": True,
-            "is_own_speech": False,
-            "sim": sim,
-        })
-
-    hits.sort(key=lambda x: -float(x["score"]))
-    return hits[:max_n]
-
 async def should_include_memories(user_input: str, speaker_id: str, user_id: str) -> Tuple[bool, List[dict]]:
-    """
-    Semantic retrieval only:
-    - FAISS (ownership-filtered) for chat + journals in the vector index
-    - Extra cosine pass over the twin's journal embeddings (FAISS can under-rank sparse notes)
-    """
+    """Top memories by similarity, after the privacy filters in find_relevant_memories."""
     if _is_lightweight_input(user_input):
         return False, []
 
     sp = await users_col.find_one({"user_id": speaker_id})
     speaker_name = (sp or {}).get("display_name") or (sp or {}).get("username") or speaker_id
-    mems = await find_relevant_memories(speaker_id, user_id, user_input, speaker_name, max_memories=8)
-
-    rel: List[dict] = []
-    for m in mems:
-        thr = 0.30 if (m.get("is_own_journal") or m.get("type") == "journal") else 0.50
-        if float(m.get("score", 0)) >= thr:
-            rel.append(m)
-
-    try:
-        journal_hits = await semantic_own_journals(user_id, user_input, max_n=3, min_sim=0.28)
-    except Exception as e:
-        logger.warning(f"semantic_own_journals failed: {e}")
-        journal_hits = []
-
-    seen = {(m.get("content") or "").strip().lower() for m in rel}
-    for j in journal_hits:
-        key = (j.get("content") or "").strip().lower()
-        if key and key not in seen:
-            rel.append(j)
-            seen.add(key)
-
-    rel.sort(key=lambda m: (
-        0 if m.get("is_own_journal") else 1,
-        -float(m.get("score") or 0),
-    ))
-    return (len(rel) > 0), rel[:3]
+    mems = await find_relevant_memories(speaker_id, user_id, user_input, speaker_name, max_memories=3)
+    return (len(mems) > 0), mems
 
 # ---------------------
 # initialize_bot (role auto-detect)
