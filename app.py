@@ -8,6 +8,8 @@ import uuid
 import threading
 import asyncio
 import logging
+import time
+import contextvars
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from contextlib import asynccontextmanager
@@ -72,6 +74,35 @@ PERSONALITY_CACHE_TTL_H = int(os.getenv("PERSONALITY_CACHE_TTL_H", "24"))
 # Minimum cosine similarity for a memory to be used. 0 = off. Calibrate per embedding
 # model with `python -m eval.run_eval --embedder gemini` before raising it.
 MEMORY_MIN_SIM = float(os.getenv("MEMORY_MIN_SIM", "0"))
+
+# Per-message timing: one "timing:" log line per reply, showing where the seconds go.
+_timings: contextvars.ContextVar = contextvars.ContextVar("timings", default=None)
+
+
+class _timed:
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        d = _timings.get()
+        if d is not None:
+            d[self.name] = d.get(self.name, 0.0) + time.perf_counter() - self.t0
+        return False
+
+
+def _timing_start() -> float:
+    _timings.set({})
+    return time.perf_counter()
+
+
+def _timing_log(label: str, t0: float) -> None:
+    d = _timings.get() or {}
+    steps = " ".join(f"{k}={v:.1f}s" for k, v in d.items())
+    logger.info(f"timing: {label} total={time.perf_counter() - t0:.1f}s {steps}")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "8"))
 FAISS_SAVE_DEBOUNCE_S = float(os.getenv("FAISS_SAVE_DEBOUNCE_S", "2.0"))
 
@@ -1747,8 +1778,10 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
     if not role_in or role_in == "friend":
         role_in = await resolve_target_role_for_reply(speaker_id, target_id)
 
-    traits = await generate_personality_traits(target_id)
-    recent = await get_recent_conversation_history(speaker_id, target_id)
+    with _timed("personality"):
+        traits = await generate_personality_traits(target_id)
+    with _timed("history"):
+        recent = await get_recent_conversation_history(speaker_id, target_id)
 
     history_for_prompt = recent[:]
     if recent:
@@ -1791,9 +1824,11 @@ async def initialize_bot(speaker_id: str, target_id: str, bot_role: Optional[str
         last_ts = None
 
     use_greeting = (not history_for_prompt) or (datetime.now(pytz.UTC)-as_utc_aware(last_ts)).total_seconds()/60 > 30
-    greeting, tone = await get_greeting_and_tone(role_in, target_id)
+    with _timed("greeting"):
+        greeting, tone = await get_greeting_and_tone(role_in, target_id)
 
-    include, mems = await should_include_memories(user_input, speaker_id, target_id)
+    with _timed("memories"):
+        include, mems = await should_include_memories(user_input, speaker_id, target_id)
     if lightweight:
         include, mems = False, []
 
@@ -1935,7 +1970,8 @@ async def save_and_embed_message(speaker_id: str, target_id: str, text: str, sou
 
     processed = preprocess_input(text)
     loop = asyncio.get_event_loop()
-    emb = await loop.run_in_executor(None, lambda: embeddings.embed_query(processed))
+    with _timed("gemini_embed"):
+        emb = await loop.run_in_executor(None, lambda: embeddings.embed_query(processed))
     await embeddings_col.insert_one({
         "item_id": conv_id, "item_type":"conversation", "user_id":[speaker_id,target_id],
         "speaker_id": speaker_id, "speaker_name": sp_name,
@@ -1949,7 +1985,7 @@ async def save_and_embed_message(speaker_id: str, target_id: str, text: str, sou
             "target_id": target_id, "target_name": tg_name,
             "timestamp": now
         })
-        with faiss_lock:
+        with _timed("faiss_add(gemini)"), faiss_lock:
             if faiss_store is not None:
                 faiss_store.add_documents([db_doc])
         _schedule_faiss_save()
@@ -1971,15 +2007,20 @@ async def send_message(req: MessageRequest, sess=Depends(require_api_and_session
     uid = sess["user"]["user_id"]
     if not _rate_allow(f"send:{uid}", RATE_SEND_PER_MIN):
         raise HTTPException(status_code=429, detail="Too many messages — slow down a bit.")
-    await save_and_embed_message(req.speaker_id, req.target_id, req.user_input, source="human")
+    t0 = _timing_start()
+    with _timed("save_message"):
+        await save_and_embed_message(req.speaker_id, req.target_id, req.user_input, source="human")
     tg = await users_col.find_one({"user_id": req.target_id})
     if tg and tg.get("ai_enabled", False):
         # Let server resolve role if not helpful
         prompt, greeting, use_greeting, twin_name = await initialize_bot(
             req.speaker_id, req.target_id, getattr(req, "bot_role", None), req.user_input
         )
-        ai_text = await generate_response(prompt, req.user_input, greeting, use_greeting, twin_name)
-        await save_and_embed_message(req.target_id, req.speaker_id, ai_text, source="ai_twin")
+        with _timed("llm_reply"):
+            ai_text = await generate_response(prompt, req.user_input, greeting, use_greeting, twin_name)
+        with _timed("save_reply"):
+            await save_and_embed_message(req.target_id, req.speaker_id, ai_text, source="ai_twin")
+        _timing_log("http", t0)
         return MessageResponse(response=ai_text)
     return MessageResponse(response="Sent.")
 
@@ -2087,8 +2128,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     except Exception:
                         pass
                     continue
+                t0 = _timing_start()
                 try:
-                    saved = await save_and_embed_message(user_id, to, text, source="human")
+                    with _timed("save_message"):
+                        saved = await save_and_embed_message(user_id, to, text, source="human")
                     await manager.send_to(to, {
                         "type": "chat", "from": user_id,
                         "payload": {
@@ -2106,8 +2149,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     tgt = await users_col.find_one({"user_id": to})
                     if tgt and tgt.get("ai_enabled", False):
                         prompt, greeting, use_greeting, twin_name = await initialize_bot(user_id, to, None, text)
-                        ai_text = await generate_response(prompt, text, greeting, use_greeting, twin_name)
-                        ai_saved = await save_and_embed_message(to, user_id, ai_text, source="ai_twin")
+                        with _timed("llm_reply"):
+                            ai_text = await generate_response(prompt, text, greeting, use_greeting, twin_name)
+                        with _timed("save_reply"):
+                            ai_saved = await save_and_embed_message(to, user_id, ai_text, source="ai_twin")
+                        _timing_log("ws", t0)
                         await manager.send_to(user_id, {
                             "type": "ai", "from": to,
                             "payload": {
