@@ -1,0 +1,18 @@
+# Pings the Render free-tier service so it doesn't spin down after 15 idle minutes.
+name: Keep Render awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping the live app
+        run: |
+          curl --silent --show-error --fail --retry 3 --retry-delay 10 --max-time 90 \
+            -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n" \
+            https://ai-twin-fastapi.onrender.com/
